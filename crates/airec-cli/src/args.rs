@@ -102,18 +102,48 @@ pub struct RecordingArgs {
     /// Output directory for multiple targets.
     #[arg(long, conflicts_with = "out")]
     pub out_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
-    pub fps: u32,
-    #[arg(long, value_enum, default_value_t = QualityArg::Medium)]
-    pub quality: QualityArg,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+    pub fps: Option<u32>,
+    #[arg(long, value_enum)]
+    pub quality: Option<QualityArg>,
     #[arg(long)]
     pub no_cursor: bool,
+    /// Include the cursor even when the config default is disabled.
+    #[arg(long, conflicts_with = "no_cursor")]
+    pub cursor: bool,
     #[arg(long)]
     pub no_effects: bool,
-    #[arg(long, default_value = "30m")]
-    pub max_duration: String,
-    #[arg(long, value_enum, default_value_t = FailureArg::Continue)]
-    pub on_failure: FailureArg,
+    /// Enable effects even when the config default is disabled.
+    #[arg(long, conflicts_with = "no_effects")]
+    pub effects: bool,
+    #[arg(long)]
+    pub max_duration: Option<String>,
+    #[arg(long, value_enum)]
+    pub on_failure: Option<FailureArg>,
+    #[arg(long)]
+    pub click_color_left: Option<String>,
+    #[arg(long)]
+    pub click_color_right: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub click_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub click_duration_ms: Option<u64>,
+    #[arg(long)]
+    pub drag_color: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub drag_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drag_duration_ms: Option<u64>,
+    #[arg(long)]
+    pub trail_color: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub trail_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub trail_duration_ms: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub drag_threshold_px: Option<u32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drag_threshold_ms: Option<u64>,
     #[arg(long)]
     pub event_log: Option<PathBuf>,
     #[arg(long)]
@@ -186,6 +216,15 @@ fn parse_hwnd(value: &str) -> Result<isize, String> {
     }
 }
 
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let parsed = value.parse::<f32>().map_err(|error| error.to_string())?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("value must be a finite number greater than zero".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
@@ -237,5 +276,41 @@ mod tests {
             panic!("expected record")
         };
         assert!(args.duration.is_none());
+    }
+
+    #[test]
+    fn config_backed_recording_values_remain_absent_when_not_on_cli() {
+        let cli = Cli::try_parse_from(["airec", "start"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start")
+        };
+        assert_eq!(args.recording.fps, None);
+        assert!(args.recording.quality.is_none());
+        assert!(args.recording.max_duration.is_none());
+        assert!(args.recording.on_failure.is_none());
+    }
+
+    #[test]
+    fn convert_contract_parses() {
+        let cli = Cli::try_parse_from([
+            "airec",
+            "convert",
+            "evidence.mp4",
+            "--out",
+            "evidence.gif",
+            "--fps",
+            "12",
+            "--width",
+            "640",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert_eq!(args.input, PathBuf::from("evidence.mp4"));
+        assert_eq!(args.fps, 12);
+        assert_eq!(args.width, 640);
+        assert!(args.json);
     }
 }

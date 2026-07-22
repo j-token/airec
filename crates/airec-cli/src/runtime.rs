@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use airec_capture::{WindowsCaptureBackend, WindowsEncoderFactory, diagnose_encoders};
 use airec_core::{
     AirecError, CaptureBackend, CaptureFrame, CaptureTarget, ControlRequest, ControlResponse,
-    EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor, InputEvent, InputSource,
-    Pipeline, Quality, RecordingOptions, ResolvedTarget, SessionOutcome, SessionRunOptions,
-    SessionSnapshot, SessionState, StopReason, TargetCatalog, TargetKind, TargetSnapshot,
-    Timestamp, run_session,
+    EffectColor, EffectStyles, EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor,
+    InputEvent, InputOptions, InputSource, Pipeline, Quality, RecordingOptions, ResolvedTarget,
+    SessionOutcome, SessionRunOptions, SessionSnapshot, SessionState, StopReason, TargetCatalog,
+    TargetKind, TargetSnapshot, Timestamp, run_session,
 };
 use airec_effects::{RippleCompositor, ScreenRect, letterbox};
 use airec_input::{EventLogWriter, MouseHook, MouseSubscription};
@@ -39,6 +39,8 @@ struct LaunchConfig {
     quality: Quality,
     cursor: bool,
     effects: bool,
+    effect_styles: EffectStyles,
+    input: InputOptions,
     max_duration_ms: u64,
     failure_policy: FailurePolicy,
     event_log: Option<PathBuf>,
@@ -163,6 +165,8 @@ fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
         quality: options.quality,
         cursor: options.cursor,
         effects: options.effects,
+        effect_styles: options.effect_styles,
+        input: options.input,
         max_duration_ms: options.max_duration.as_millis() as u64,
         failure_policy: options.failure_policy,
         event_log: options.event_log,
@@ -504,6 +508,8 @@ fn session_child(config_path: &Path) -> Result<i32, AirecError> {
         quality: launch.quality,
         cursor: launch.cursor,
         effects: launch.effects,
+        effect_styles: launch.effect_styles,
+        input: launch.input,
         max_duration: Duration::from_millis(launch.max_duration_ms),
         first_frame_timeout: airec_core::FIRST_FRAME_TIMEOUT,
         failure_policy: launch.failure_policy,
@@ -568,7 +574,10 @@ fn run_live(
     let need_input = options.effects || options.event_log.is_some();
     let timeline_origin_ms = Arc::new(AtomicU64::new(u64::MAX));
     let mouse_hook = if need_input {
-        Some(MouseHook::install(options.started_at)?)
+        Some(MouseHook::install_with_options(
+            options.started_at,
+            options.input,
+        )?)
     } else {
         None
     };
@@ -766,7 +775,8 @@ fn create_pipeline(
         enabled: options.effects,
         input: mouse_hook.map(MouseHook::subscribe),
         timeline_origin_ms,
-        compositor: RippleCompositor::default(),
+        compositor: RippleCompositor::new(options.effect_styles),
+        last_viewport: None,
     });
     Ok(Pipeline {
         target: target.output.to_string_lossy().into_owned(),
@@ -818,6 +828,7 @@ struct ClickProcessor {
     input: Option<MouseSubscription>,
     timeline_origin_ms: Arc<AtomicU64>,
     compositor: RippleCompositor,
+    last_viewport: Option<(ScreenRect, ScreenRect)>,
 }
 
 fn normalize_input_event(event: InputEvent, origin_ms: u64) -> Option<InputEvent> {
@@ -869,7 +880,10 @@ impl FrameProcessor for ClickProcessor {
                 .into_iter()
                 .filter_map(|event| normalize_input_event(event, origin))
                 .collect::<Vec<_>>();
-            if let Some((clip, mapping)) = target_viewport(&self.target) {
+            if let Some(viewport) = target_viewport(&self.target) {
+                self.last_viewport = Some(viewport);
+            }
+            if let Some((clip, mapping)) = self.last_viewport {
                 self.compositor
                     .push_events_mapped(events, clip, mapping, &frame);
                 self.compositor.render(&mut frame);
@@ -957,30 +971,265 @@ fn prepare(
     targets: &TargetArgs,
     recording: &RecordingArgs,
 ) -> Result<(Vec<ResolvedTarget>, RecordingOptions), AirecError> {
+    let loaded = crate::config::load()?;
+    let options = resolve_recording_options(recording, &loaded.value)?;
+    if options.verbose
+        && let Some(path) = loaded.path
+    {
+        eprintln!("airec: config {}", path.display());
+    }
     let target_specs = target_specs(targets)?;
     let (output, directory) = output_path(recording);
     let backend = WindowsCaptureBackend::new();
     let resolved = backend.resolve(&target_specs, &output, directory)?;
-    let options = RecordingOptions {
+    Ok((resolved, options))
+}
+
+fn resolve_recording_options(
+    recording: &RecordingArgs,
+    config: &crate::config::AppConfig,
+) -> Result<RecordingOptions, AirecError> {
+    let fps = recording.fps.or(config.defaults.fps).unwrap_or(30);
+    if !(1..=60).contains(&fps) {
+        return Err(config_value_error(
+            "defaults.fps",
+            "must be between 1 and 60",
+        ));
+    }
+    let quality = if let Some(value) = recording.quality {
+        quality_from_arg(value)
+    } else if let Some(value) = config.defaults.quality.as_deref() {
+        parse_quality(value)?
+    } else {
+        Quality::Medium
+    };
+    let failure_policy = if let Some(value) = recording.on_failure {
+        failure_from_arg(value)
+    } else if let Some(value) = config.defaults.on_failure.as_deref() {
+        parse_failure_policy(value)?
+    } else {
+        FailurePolicy::Continue
+    };
+    let cursor = if recording.cursor {
+        true
+    } else if recording.no_cursor {
+        false
+    } else {
+        config.defaults.cursor.unwrap_or(true)
+    };
+    let effects = if recording.effects {
+        true
+    } else if recording.no_effects {
+        false
+    } else {
+        config.defaults.effects.unwrap_or(true)
+    };
+    let mut effect_styles = EffectStyles::default();
+    effect_styles.click.left_color = resolve_color(
+        recording.click_color_left.as_deref(),
+        config.effects.click_color_left.as_deref(),
+        effect_styles.click.left_color,
+        "effects.click_color_left",
+    )?;
+    effect_styles.click.right_color = resolve_color(
+        recording.click_color_right.as_deref(),
+        config.effects.click_color_right.as_deref(),
+        effect_styles.click.right_color,
+        "effects.click_color_right",
+    )?;
+    effect_styles.click.size = resolve_positive_f32(
+        recording.click_size,
+        config.effects.click_size,
+        effect_styles.click.size,
+        "effects.click_size",
+    )?;
+    effect_styles.click.duration_ms = resolve_positive_u64(
+        recording.click_duration_ms,
+        config.effects.click_duration_ms,
+        effect_styles.click.duration_ms,
+        "effects.click_duration_ms",
+    )?;
+    effect_styles.drag.color = resolve_color(
+        recording.drag_color.as_deref(),
+        config.effects.drag_color.as_deref(),
+        effect_styles.drag.color,
+        "effects.drag_color",
+    )?;
+    effect_styles.drag.size = resolve_positive_f32(
+        recording.drag_size,
+        config.effects.drag_size,
+        effect_styles.drag.size,
+        "effects.drag_size",
+    )?;
+    effect_styles.drag.duration_ms = resolve_positive_u64(
+        recording.drag_duration_ms,
+        config.effects.drag_duration_ms,
+        effect_styles.drag.duration_ms,
+        "effects.drag_duration_ms",
+    )?;
+    effect_styles.trail.color = resolve_color(
+        recording.trail_color.as_deref(),
+        config.effects.trail_color.as_deref(),
+        effect_styles.trail.color,
+        "effects.trail_color",
+    )?;
+    effect_styles.trail.size = resolve_positive_f32(
+        recording.trail_size,
+        config.effects.trail_size,
+        effect_styles.trail.size,
+        "effects.trail_size",
+    )?;
+    effect_styles.trail.duration_ms = resolve_positive_u64(
+        recording.trail_duration_ms,
+        config.effects.trail_duration_ms,
+        effect_styles.trail.duration_ms,
+        "effects.trail_duration_ms",
+    )?;
+    let mut input = InputOptions::default();
+    input.drag_threshold_pixels = resolve_positive_u32(
+        recording.drag_threshold_px,
+        config.effects.drag_threshold_px,
+        input.drag_threshold_pixels,
+        "effects.drag_threshold_px",
+    )?;
+    input.drag_threshold_ms = resolve_positive_u64(
+        recording.drag_threshold_ms,
+        config.effects.drag_threshold_ms,
+        input.drag_threshold_ms,
+        "effects.drag_threshold_ms",
+    )?;
+    let max_duration = recording
+        .max_duration
+        .as_deref()
+        .or(config.defaults.max_duration.as_deref())
+        .unwrap_or("30m");
+    Ok(RecordingOptions {
         started_at: Instant::now(),
-        fps: recording.fps,
-        quality: match recording.quality {
-            QualityArg::Low => Quality::Low,
-            QualityArg::Medium => Quality::Medium,
-            QualityArg::High => Quality::High,
-        },
-        cursor: !recording.no_cursor,
-        effects: !recording.no_effects,
-        max_duration: parse_duration(&recording.max_duration)?,
+        fps,
+        quality,
+        cursor,
+        effects,
+        effect_styles,
+        input,
+        max_duration: parse_duration(max_duration)?,
         first_frame_timeout: airec_core::FIRST_FRAME_TIMEOUT,
-        failure_policy: match recording.on_failure {
-            FailureArg::Continue => FailurePolicy::Continue,
-            FailureArg::Abort => FailurePolicy::Abort,
-        },
+        failure_policy,
         event_log: recording.event_log.clone(),
         verbose: recording.verbose,
+    })
+}
+
+const fn quality_from_arg(value: QualityArg) -> Quality {
+    match value {
+        QualityArg::Low => Quality::Low,
+        QualityArg::Medium => Quality::Medium,
+        QualityArg::High => Quality::High,
+    }
+}
+
+const fn failure_from_arg(value: FailureArg) -> FailurePolicy {
+    match value {
+        FailureArg::Continue => FailurePolicy::Continue,
+        FailureArg::Abort => FailurePolicy::Abort,
+    }
+}
+
+fn parse_quality(value: &str) -> Result<Quality, AirecError> {
+    match value {
+        "low" => Ok(Quality::Low),
+        "medium" => Ok(Quality::Medium),
+        "high" => Ok(Quality::High),
+        _ => Err(config_value_error(
+            "defaults.quality",
+            "must be low, medium, or high",
+        )),
+    }
+}
+
+fn parse_failure_policy(value: &str) -> Result<FailurePolicy, AirecError> {
+    match value {
+        "continue" => Ok(FailurePolicy::Continue),
+        "abort" => Ok(FailurePolicy::Abort),
+        _ => Err(config_value_error(
+            "defaults.on_failure",
+            "must be continue or abort",
+        )),
+    }
+}
+
+fn resolve_color(
+    cli: Option<&str>,
+    config: Option<&str>,
+    default: EffectColor,
+    key: &str,
+) -> Result<EffectColor, AirecError> {
+    cli.or(config)
+        .map_or(Ok(default), |value| parse_color(value, key))
+}
+
+fn parse_color(value: &str, key: &str) -> Result<EffectColor, AirecError> {
+    let hex = value
+        .strip_prefix('#')
+        .filter(|hex| hex.len() == 6)
+        .ok_or_else(|| config_value_error(key, "must use #RRGGBB"))?;
+    let channel = |range| {
+        u8::from_str_radix(&hex[range], 16).map_err(|_| config_value_error(key, "must use #RRGGBB"))
     };
-    Ok((resolved, options))
+    Ok(EffectColor::rgb(
+        channel(0..2)?,
+        channel(2..4)?,
+        channel(4..6)?,
+    ))
+}
+
+fn resolve_positive_f32(
+    cli: Option<f32>,
+    config: Option<f32>,
+    default: f32,
+    key: &str,
+) -> Result<f32, AirecError> {
+    let value = cli.or(config).unwrap_or(default);
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(config_value_error(key, "must be greater than zero"))
+    }
+}
+
+fn resolve_positive_u64(
+    cli: Option<u64>,
+    config: Option<u64>,
+    default: u64,
+    key: &str,
+) -> Result<u64, AirecError> {
+    let value = cli.or(config).unwrap_or(default);
+    if value > 0 {
+        Ok(value)
+    } else {
+        Err(config_value_error(key, "must be greater than zero"))
+    }
+}
+
+fn resolve_positive_u32(
+    cli: Option<u32>,
+    config: Option<u32>,
+    default: u32,
+    key: &str,
+) -> Result<u32, AirecError> {
+    let value = cli.or(config).unwrap_or(default);
+    if value > 0 {
+        Ok(value)
+    } else {
+        Err(config_value_error(key, "must be greater than zero"))
+    }
+}
+
+fn config_value_error(key: &str, message: &str) -> AirecError {
+    AirecError::new(
+        ErrorCode::CaptureInitFailed,
+        format!("invalid config value {key}: {message}"),
+        serde_json::json!({"component": "config", "key": key}),
+    )
 }
 
 fn target_specs(args: &TargetArgs) -> Result<Vec<CaptureTarget>, AirecError> {
@@ -1501,6 +1750,8 @@ fn even(value: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     #[test]
@@ -1608,5 +1859,101 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn parsed_recording(arguments: &[&str]) -> RecordingArgs {
+        let cli = crate::args::Cli::try_parse_from(arguments).unwrap();
+        match cli.command {
+            Command::Record(args) => args.recording,
+            Command::Start(args) => args.recording,
+            _ => panic!("expected a recording command"),
+        }
+    }
+
+    #[test]
+    fn config_values_apply_when_cli_values_are_absent() {
+        let recording = parsed_recording(&["airec", "record"]);
+        let config: crate::config::AppConfig = toml::from_str(
+            r##"
+                [defaults]
+                fps = 24
+                quality = "high"
+                cursor = false
+                effects = false
+                max_duration = "2m"
+                on_failure = "abort"
+
+                [effects]
+                click_color_left = "#112233"
+                trail_size = 8.5
+                drag_threshold_px = 9
+                drag_threshold_ms = 275
+            "##,
+        )
+        .unwrap();
+        let options = resolve_recording_options(&recording, &config).unwrap();
+        assert_eq!(options.fps, 24);
+        assert_eq!(options.quality, Quality::High);
+        assert!(!options.cursor);
+        assert!(!options.effects);
+        assert_eq!(options.max_duration, Duration::from_secs(120));
+        assert_eq!(options.failure_policy, FailurePolicy::Abort);
+        assert_eq!(
+            options.effect_styles.click.left_color,
+            EffectColor::rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(options.effect_styles.trail.size, 8.5);
+        assert_eq!(options.input.drag_threshold_pixels, 9);
+        assert_eq!(options.input.drag_threshold_ms, 275);
+    }
+
+    #[test]
+    fn explicit_cli_values_override_config_including_boolean_enables() {
+        let recording = parsed_recording(&[
+            "airec",
+            "start",
+            "--fps",
+            "60",
+            "--quality",
+            "low",
+            "--cursor",
+            "--effects",
+            "--trail-size",
+            "2.0",
+            "--on-failure",
+            "continue",
+        ]);
+        let config: crate::config::AppConfig = toml::from_str(
+            r#"
+                [defaults]
+                fps = 12
+                quality = "high"
+                cursor = false
+                effects = false
+                on_failure = "abort"
+
+                [effects]
+                trail_size = 9.0
+            "#,
+        )
+        .unwrap();
+        let options = resolve_recording_options(&recording, &config).unwrap();
+        assert_eq!(options.fps, 60);
+        assert_eq!(options.quality, Quality::Low);
+        assert!(options.cursor);
+        assert!(options.effects);
+        assert_eq!(options.effect_styles.trail.size, 2.0);
+        assert_eq!(options.failure_policy, FailurePolicy::Continue);
+    }
+
+    #[test]
+    fn malformed_effect_color_is_a_stable_config_error() {
+        let recording = parsed_recording(&["airec", "record"]);
+        let config: crate::config::AppConfig =
+            toml::from_str("[effects]\nclick_color_left = 'yellow'\n").unwrap();
+        let error = resolve_recording_options(&recording, &config).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CaptureInitFailed);
+        assert_eq!(error.data["component"], "config");
+        assert_eq!(error.data["key"], "effects.click_color_left");
     }
 }
