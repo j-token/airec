@@ -50,3 +50,11 @@ windows-capture = { version = "2.0.0", path = "vendor/windows-capture" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
