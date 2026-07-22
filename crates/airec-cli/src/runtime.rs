@@ -204,16 +204,7 @@ fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
 }
 
 fn status(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
-    let states = session_states().map_err(|error| (error, args.json))?;
-    let active: Vec<_> = states
-        .into_iter()
-        .filter(|state| {
-            matches!(
-                state.snapshot.state,
-                SessionState::Starting | SessionState::Recording | SessionState::Stopping
-            )
-        })
-        .collect();
+    let active = active_sessions().map_err(|error| (error, args.json))?;
     if active.is_empty() {
         return Err((
             AirecError::new(
@@ -224,20 +215,13 @@ fn status(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
             args.json,
         ));
     }
-    let mut snapshots = Vec::new();
-    for state in active {
-        match ipc::request(&state.snapshot.session, &ControlRequest::Status) {
-            Ok(ControlResponse::Status { session }) => snapshots.push(session),
-            _ => snapshots.push(state.snapshot),
-        }
-    }
     if args.json {
         println!(
             "{}",
-            serde_json::to_string(&snapshots).expect("status JSON serialization")
+            serde_json::to_string(&active).expect("status JSON serialization")
         );
     } else {
-        for snapshot in snapshots {
+        for snapshot in active {
             println!(
                 "{} {:?} {} target(s)",
                 snapshot.session,
@@ -250,18 +234,9 @@ fn status(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
 }
 
 fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
-    let states = session_states().map_err(|error| (error, args.json))?;
-    let active: Vec<_> = states
-        .into_iter()
-        .filter(|state| {
-            matches!(
-                state.snapshot.state,
-                SessionState::Starting | SessionState::Recording | SessionState::Stopping
-            )
-        })
-        .collect();
+    let active = active_sessions().map_err(|error| (error, args.json))?;
     let session = if let Some(session) = args.session {
-        if !active.iter().any(|state| state.snapshot.session == session) {
+        if !active.iter().any(|state| state.session == session) {
             return Err((
                 AirecError::new(
                     ErrorCode::NoActiveSession,
@@ -284,13 +259,13 @@ fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
                     args.json,
                 ));
             }
-            [state] => state.snapshot.session.clone(),
+            [state] => state.session.clone(),
             _ => {
                 return Err((
                     AirecError::new(
                         ErrorCode::SessionAmbiguous,
                         "more than one recording session is active",
-                        serde_json::json!({"sessions": active.iter().map(|state| &state.snapshot.session).collect::<Vec<_>>()}),
+                        serde_json::json!({"sessions": active.iter().map(|state| &state.session).collect::<Vec<_>>()}),
                     ),
                     args.json,
                 ));
@@ -998,6 +973,25 @@ fn session_states() -> Result<Vec<StateFile>, AirecError> {
         .filter_map(Result::ok)
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with("launch-"))
         .filter_map(|entry| read_json_file::<StateFile>(&entry.path()).ok())
+        .collect())
+}
+
+fn active_sessions() -> Result<Vec<SessionSnapshot>, AirecError> {
+    let states = session_states()?;
+    Ok(states
+        .into_iter()
+        .filter(|state| {
+            matches!(
+                state.snapshot.state,
+                SessionState::Starting | SessionState::Recording | SessionState::Stopping
+            )
+        })
+        .filter_map(
+            |state| match ipc::request(&state.snapshot.session, &ControlRequest::Status) {
+                Ok(ControlResponse::Status { session }) => Some(session),
+                _ => None,
+            },
+        )
         .collect())
 }
 
