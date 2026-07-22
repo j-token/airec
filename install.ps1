@@ -141,12 +141,20 @@ New-Item -ItemType Directory -Path $work | Out-Null
 try {
     $zip = Join-Path $work $assetName
     Write-Step "downloading $tag"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -Headers $headers
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -Headers $headers -UseBasicParsing
 
     if ($checksumAsset) {
         Write-Step "verifying checksum"
-        $expected = ((Invoke-WebRequest -Uri $checksumAsset.browser_download_url -Headers $headers).Content -split '\s+')[0].Trim().ToLower()
+        # Read the checksum from a file rather than from the response body:
+        # GitHub serves release assets as application/octet-stream, and PowerShell 7
+        # hands that back as a byte array, which would stringify to ASCII codes.
+        $checksumFile = Join-Path $work "$assetName.sha256"
+        Invoke-WebRequest -Uri $checksumAsset.browser_download_url -OutFile $checksumFile -Headers $headers -UseBasicParsing
+        $expected = (((Get-Content $checksumFile -Raw) -split '\s+')[0]).Trim().ToLower()
         $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+        if ($expected -notmatch '^[0-9a-f]{64}$') {
+            throw "could not read a SHA256 from $assetName.sha256. The download was not installed."
+        }
         if ($expected -ne $actual) {
             throw "checksum mismatch for $assetName (expected $expected, got $actual). The download was not installed."
         }
