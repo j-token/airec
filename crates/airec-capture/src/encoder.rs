@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use airec_core::{
-    AirecError, CaptureFrame, EncoderFactory, ErrorCode, PipelineEncoder, RecordingOptions, ResolvedTarget,
+    AirecError, CaptureFrame, EncoderFactory, ErrorCode, PipelineEncoder, RecordingOptions,
+    ResolvedTarget,
 };
 use windows_capture::encoder::{
-    AudioSettingsBuilder, ContainerSettingsBuilder, ContainerSettingsSubType, VideoEncoder, VideoSettingsBuilder,
-    VideoSettingsSubType,
+    AudioSettingsBuilder, ContainerSettingsBuilder, ContainerSettingsSubType, VideoEncoder,
+    VideoSettingsBuilder, VideoSettingsSubType,
 };
 
 #[derive(Default)]
@@ -32,9 +33,15 @@ impl EncoderFactory for WindowsEncoderFactory {
             bitrate: options.quality.bitrate(width, height, options.fps),
         };
         match create_encoder(&config, true) {
-            Ok(encoder) => Ok(Box::new(MfEncoder { encoder: Some(encoder), config, hardware: true })),
+            Ok(encoder) => Ok(Box::new(MfEncoder {
+                encoder: Some(encoder),
+                config,
+                hardware: true,
+            })),
             Err(hardware_error) => {
-                eprintln!("warning: hardware H.264 encoder unavailable ({hardware_error}); falling back to software");
+                eprintln!(
+                    "warning: hardware H.264 encoder unavailable ({hardware_error}); falling back to software"
+                );
                 let encoder = create_encoder(&config, false).map_err(|software_error| {
                     AirecError::new(
                         ErrorCode::EncoderUnavailable,
@@ -45,7 +52,11 @@ impl EncoderFactory for WindowsEncoderFactory {
                         }),
                     )
                 })?;
-                Ok(Box::new(MfEncoder { encoder: Some(encoder), config, hardware: false }))
+                Ok(Box::new(MfEncoder {
+                    encoder: Some(encoder),
+                    config,
+                    hardware: false,
+                }))
             }
         }
     }
@@ -101,7 +112,9 @@ impl PipelineEncoder for MfEncoder {
                 return Err(encoder_error(hardware_error));
             }
             self.encoder.take();
-            eprintln!("warning: hardware H.264 encoder failed on the first sample ({hardware_error}); falling back to software");
+            eprintln!(
+                "warning: hardware H.264 encoder failed on the first sample ({hardware_error}); falling back to software"
+            );
             let mut software = create_encoder(&self.config, false).map_err(|software_error| {
                 AirecError::new(
                     ErrorCode::EncoderUnavailable,
@@ -112,15 +125,21 @@ impl PipelineEncoder for MfEncoder {
                     }),
                 )
             })?;
-            software.send_frame_buffer(&packed, timestamp_hns).map_err(encoder_error)?;
+            software
+                .send_frame_buffer(&packed, timestamp_hns)
+                .map_err(encoder_error)?;
             self.encoder = Some(software);
             self.hardware = false;
         }
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(), AirecError> {
-        self.encoder.take().expect("encoder exists until finish").finish().map_err(encoder_error)
+    fn finish(&mut self) -> Result<(), AirecError> {
+        self.encoder
+            .take()
+            .expect("encoder exists until finish")
+            .finish()
+            .map_err(encoder_error)
     }
 }
 
@@ -142,11 +161,19 @@ fn packed_bottom_up(frame: &CaptureFrame, width: u32, height: u32) -> Vec<u8> {
 }
 
 fn encoder_error(error: windows_capture::encoder::VideoEncoderError) -> AirecError {
-    AirecError::new(ErrorCode::OutputIoError, error.to_string(), serde_json::json!({"component": "encoder"}))
+    AirecError::new(
+        ErrorCode::OutputIoError,
+        error.to_string(),
+        serde_json::json!({"component": "encoder"}),
+    )
 }
 
 fn output_error(path: &Path, error: std::io::Error) -> AirecError {
-    AirecError::new(ErrorCode::OutputIoError, error.to_string(), serde_json::json!({"path": path}))
+    AirecError::new(
+        ErrorCode::OutputIoError,
+        error.to_string(),
+        serde_json::json!({"path": path}),
+    )
 }
 
 #[cfg(test)]
@@ -165,7 +192,10 @@ mod tests {
             width: 2,
             height: 2,
             stride: 12,
-            bgra: vec![1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99, 99, 99],
+            bgra: vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99, 99,
+                99,
+            ],
             t_ms: 0,
         };
         assert_eq!(

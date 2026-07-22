@@ -36,7 +36,10 @@ pub enum StopReason {
 impl StopReason {
     #[must_use]
     pub const fn is_intended(self) -> bool {
-        matches!(self, Self::Requested | Self::DurationLimit | Self::MaxDuration)
+        matches!(
+            self,
+            Self::Requested | Self::DurationLimit | Self::MaxDuration
+        )
     }
 }
 
@@ -141,7 +144,10 @@ mod tests {
             (StopReason::AbortedOnFailure, "aborted_on_failure", false),
         ];
         for (reason, wire, intended) in cases {
-            assert_eq!(serde_json::to_string(&reason).unwrap(), format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{wire}\"")
+            );
             assert_eq!(reason.is_intended(), intended);
         }
     }
@@ -152,7 +158,11 @@ mod tests {
             ts: ts(),
             session: "a1b2".into(),
             target: None,
-            targets: vec![TargetSummary { kind: "window".into(), title: Some("MyApp".into()), file: "evidence.mp4".into() }],
+            targets: vec![TargetSummary {
+                kind: "window".into(),
+                title: Some("MyApp".into()),
+                file: "evidence.mp4".into(),
+            }],
         };
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["event"], "started");
@@ -179,4 +189,3 @@ mod tests {
         serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]).unwrap();
     }
 }
-

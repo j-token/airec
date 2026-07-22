@@ -48,4 +48,3 @@ pub struct SessionSnapshot {
     pub targets: Vec<TargetSnapshot>,
     pub updated_at: String,
 }
-

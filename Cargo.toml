@@ -6,6 +6,7 @@ members = [
     "crates/airec-effects",
     "crates/airec-input",
 ]
+exclude = ["vendor/windows-capture"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 ctrlc = "3.4"
+interprocess = "2.2.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

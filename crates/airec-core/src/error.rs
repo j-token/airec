@@ -44,7 +44,11 @@ pub struct AirecError {
 impl AirecError {
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>, data: Value) -> Self {
-        Self { code, message: message.into(), data }
+        Self {
+            code,
+            message: message.into(),
+            data,
+        }
     }
 
     #[must_use]
@@ -79,7 +83,9 @@ mod tests {
 
     #[test]
     fn code_serialization_matches_contract() {
-        assert_eq!(serde_json::to_string(&ErrorCode::FirstFrameTimeout).unwrap(), "\"FIRST_FRAME_TIMEOUT\"");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::FirstFrameTimeout).unwrap(),
+            "\"FIRST_FRAME_TIMEOUT\""
+        );
     }
 }
-

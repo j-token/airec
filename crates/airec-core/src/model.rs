@@ -100,6 +100,7 @@ pub struct RecordingOptions {
     pub first_frame_timeout: Duration,
     pub failure_policy: FailurePolicy,
     pub event_log: Option<PathBuf>,
+    pub verbose: bool,
 }
 
 impl Default for RecordingOptions {
@@ -114,6 +115,7 @@ impl Default for RecordingOptions {
             first_frame_timeout: FIRST_FRAME_TIMEOUT,
             failure_policy: FailurePolicy::Continue,
             event_log: None,
+            verbose: false,
         }
     }
 }
@@ -145,13 +147,26 @@ pub trait TargetCatalog: Send + Sync {
 }
 
 pub trait CaptureBackend: TargetCatalog {
-    fn open(&self, target: &ResolvedTarget, options: &RecordingOptions)
-    -> Result<Box<dyn FrameSource>, AirecError>;
+    fn open(
+        &self,
+        target: &ResolvedTarget,
+        options: &RecordingOptions,
+    ) -> Result<Box<dyn FrameSource>, AirecError>;
 }
 
 pub trait PipelineEncoder: Send {
     fn write_frame(&mut self, frame: &CaptureFrame) -> Result<(), AirecError>;
-    fn finish(self: Box<Self>) -> Result<(), AirecError>;
+    fn finish(&mut self) -> Result<(), AirecError>;
+}
+
+pub trait FrameProcessor: Send {
+    fn process(&mut self, frame: CaptureFrame) -> Result<CaptureFrame, AirecError>;
+}
+
+impl FrameProcessor for () {
+    fn process(&mut self, frame: CaptureFrame) -> Result<CaptureFrame, AirecError> {
+        Ok(frame)
+    }
 }
 
 pub trait EncoderFactory: Send + Sync {
@@ -172,10 +187,30 @@ pub enum MouseButton {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum InputEvent {
-    Click { t_ms: u64, button: MouseButton, x: i32, y: i32, double: bool },
-    DragStart { t_ms: u64, button: MouseButton, x: i32, y: i32 },
-    DragEnd { t_ms: u64, button: MouseButton, x: i32, y: i32 },
-    Move { t_ms: u64, x: i32, y: i32 },
+    Click {
+        t_ms: u64,
+        button: MouseButton,
+        x: i32,
+        y: i32,
+        double: bool,
+    },
+    DragStart {
+        t_ms: u64,
+        button: MouseButton,
+        x: i32,
+        y: i32,
+    },
+    DragEnd {
+        t_ms: u64,
+        button: MouseButton,
+        x: i32,
+        y: i32,
+    },
+    Move {
+        t_ms: u64,
+        x: i32,
+        y: i32,
+    },
 }
 
 pub trait InputSource: Send {
