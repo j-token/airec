@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::{Interface, PCWSTR};
 
 const HNS_PER_SECOND: u128 = 10_000_000;
-const GIF_TIME_UNITS_PER_SECOND: u64 = 100;
+const GIF_TIME_UNITS_PER_SECOND: u128 = 100;
 
 /// Settings for converting an MP4 recording into an animated GIF.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +250,66 @@ struct FrameLayout {
     stride: i32,
 }
 
+struct TimestampSampler {
+    fps: u32,
+    first_timestamp: Option<i64>,
+    next_sample_slot: u64,
+    source_end_hns: u64,
+}
+
+struct SampleTiming {
+    relative_hns: u64,
+    selected: bool,
+}
+
+impl TimestampSampler {
+    fn new(fps: u32) -> Self {
+        Self {
+            fps,
+            first_timestamp: None,
+            next_sample_slot: 0,
+            source_end_hns: 0,
+        }
+    }
+
+    fn observe(&mut self, timestamp: i64, duration_hns: u64) -> SampleTiming {
+        let base = *self.first_timestamp.get_or_insert(timestamp);
+        let relative_hns = timestamp.saturating_sub(base).max(0) as u64;
+        self.source_end_hns = self
+            .source_end_hns
+            .max(relative_hns.saturating_add(duration_hns));
+        let selected = u128::from(relative_hns) * u128::from(self.fps)
+            >= u128::from(self.next_sample_slot) * HNS_PER_SECOND;
+        if selected {
+            self.next_sample_slot = self.next_sample_slot.saturating_add(1);
+            while u128::from(relative_hns) * u128::from(self.fps)
+                >= u128::from(self.next_sample_slot) * HNS_PER_SECOND
+            {
+                self.next_sample_slot = self.next_sample_slot.saturating_add(1);
+            }
+        }
+        SampleTiming {
+            relative_hns,
+            selected,
+        }
+    }
+
+    fn end_hns(&self, last_frame_start_hns: u64) -> u64 {
+        if self.source_end_hns > last_frame_start_hns {
+            self.source_end_hns
+        } else {
+            let nominal_frame_hns =
+                u64::try_from(HNS_PER_SECOND.div_ceil(u128::from(self.fps))).unwrap_or(u64::MAX);
+            last_frame_start_hns.saturating_add(nominal_frame_hns)
+        }
+    }
+}
+
+struct PendingFrame {
+    indexed: Vec<u8>,
+    start_hns: u64,
+}
+
 fn decode_with_media_foundation(
     input: &Path,
     output: &Path,
@@ -278,8 +338,8 @@ fn decode_with_media_foundation(
     let mut gif = None;
     let mut output_dimensions = None;
     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-    let mut first_timestamp = None;
-    let mut next_sample_slot = 0_u64;
+    let mut sampler = TimestampSampler::new(options.fps);
+    let mut pending_frame: Option<PendingFrame> = None;
     let mut frames = 0_u64;
     let mut duration_ms = 0_u64;
 
@@ -319,11 +379,9 @@ fn decode_with_media_foundation(
         }
 
         if let Some(sample) = sample {
-            let base = *first_timestamp.get_or_insert(timestamp);
-            let relative = timestamp.saturating_sub(base).max(0) as u64;
-            let reached_slot = u128::from(relative) * u128::from(options.fps)
-                >= u128::from(next_sample_slot) * HNS_PER_SECOND;
-            if reached_slot {
+            let sample_duration = unsafe { sample.GetSampleDuration() }.unwrap_or(0).max(0) as u64;
+            let timing = sampler.observe(timestamp, sample_duration);
+            if timing.selected {
                 if gif.is_none() {
                     let (output_width, output_height) =
                         scaled_dimensions(layout.width, layout.height, options.max_width)?;
@@ -354,19 +412,22 @@ fn decode_with_media_foundation(
                     output_height,
                 );
                 let indexed = quantize_bgra(&scaled);
-                let delay = frame_delay_centiseconds(frames, options.fps);
-                gif.as_mut()
-                    .expect("GIF writer exists after first sampled frame")
-                    .write_frame(&indexed, delay)
+                if let Some(previous) = pending_frame.take() {
+                    let (written_frames, written_duration_ms) = write_timed_frame(
+                        gif.as_mut()
+                            .expect("GIF writer exists after first sampled frame"),
+                        &previous.indexed,
+                        previous.start_hns,
+                        timing.relative_hns,
+                    )
                     .map_err(|error| output_error(output, "write GIF frame", error))?;
-                frames += 1;
-                duration_ms = duration_ms.saturating_add(u64::from(delay) * 10);
-                next_sample_slot += 1;
-                while u128::from(relative) * u128::from(options.fps)
-                    >= u128::from(next_sample_slot) * HNS_PER_SECOND
-                {
-                    next_sample_slot += 1;
+                    frames = frames.saturating_add(written_frames);
+                    duration_ms = duration_ms.saturating_add(written_duration_ms);
                 }
+                pending_frame = Some(PendingFrame {
+                    indexed,
+                    start_hns: timing.relative_hns,
+                });
             }
         }
 
@@ -375,13 +436,24 @@ fn decode_with_media_foundation(
         }
     }
 
-    if frames == 0 {
-        return Err(decode_error(
+    let pending_frame = pending_frame.ok_or_else(|| {
+        decode_error(
             input,
             "decode video",
             "input contains no decodable video frames",
-        ));
-    }
+        )
+    })?;
+    let end_hns = sampler.end_hns(pending_frame.start_hns);
+    let (written_frames, written_duration_ms) = write_timed_frame(
+        gif.as_mut()
+            .expect("a pending frame has an initialized GIF writer"),
+        &pending_frame.indexed,
+        pending_frame.start_hns,
+        end_hns,
+    )
+    .map_err(|error| output_error(output, "write final GIF frame", error))?;
+    frames = frames.saturating_add(written_frames);
+    duration_ms = duration_ms.saturating_add(written_duration_ms);
 
     let mut writer = gif
         .expect("a non-empty conversion initialized its GIF writer")
@@ -680,17 +752,37 @@ fn fixed_palette() -> [u8; 256 * 3] {
     palette
 }
 
-fn frame_delay_centiseconds(frame_index: u64, fps: u32) -> u16 {
-    let fps = u64::from(fps);
-    let rounded = |frames: u64| {
-        frames
-            .saturating_mul(GIF_TIME_UNITS_PER_SECOND)
-            .saturating_add(fps / 2)
-            / fps
-    };
-    let start = rounded(frame_index);
-    let end = rounded(frame_index.saturating_add(1));
-    u16::try_from(end.saturating_sub(start).max(1)).unwrap_or(u16::MAX)
+fn timeline_centiseconds(timestamp_hns: u64) -> u64 {
+    u64::try_from(
+        (u128::from(timestamp_hns) * GIF_TIME_UNITS_PER_SECOND + HNS_PER_SECOND / 2)
+            / HNS_PER_SECOND,
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn timeline_delay_centiseconds(start_hns: u64, end_hns: u64) -> u64 {
+    timeline_centiseconds(end_hns)
+        .saturating_sub(timeline_centiseconds(start_hns))
+        .max(1)
+}
+
+fn write_timed_frame<W: Write>(
+    gif: &mut GifEncoder<W>,
+    indexed: &[u8],
+    start_hns: u64,
+    end_hns: u64,
+) -> io::Result<(u64, u64)> {
+    let mut remaining_delay = timeline_delay_centiseconds(start_hns, end_hns);
+    let total_delay = remaining_delay;
+    let mut frames = 0_u64;
+    while remaining_delay != 0 {
+        let delay = u16::try_from(remaining_delay.min(u64::from(u16::MAX)))
+            .expect("GIF delay chunk is bounded by u16::MAX");
+        gif.write_frame(indexed, delay)?;
+        remaining_delay -= u64::from(delay);
+        frames += 1;
+    }
+    Ok((frames, total_delay.saturating_mul(10)))
 }
 
 struct GifEncoder<W: Write> {
@@ -919,6 +1011,33 @@ mod tests {
             String::from_utf16(&unc[..unc.len() - 1]).unwrap(),
             r"\\server\share\evidence.mp4"
         );
+    }
+
+    #[test]
+    fn sparse_source_timestamps_preserve_elapsed_timeline() {
+        let mut sampler = TimestampSampler::new(10);
+        let samples = [
+            (0_i64, 5_000_000_u64),
+            (5_000_000, 5_000_000),
+            (20_000_000, 5_000_000),
+        ];
+        let selected = samples
+            .into_iter()
+            .filter_map(|(timestamp, duration)| {
+                let timing = sampler.observe(timestamp, duration);
+                timing.selected.then_some(timing.relative_hns)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected, [0, 5_000_000, 20_000_000]);
+        let end = sampler.end_hns(*selected.last().unwrap());
+        let delays = selected
+            .iter()
+            .copied()
+            .zip(selected.iter().copied().skip(1).chain(std::iter::once(end)))
+            .map(|(start, end)| timeline_delay_centiseconds(start, end))
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [50, 150, 50]);
+        assert_eq!(delays.into_iter().sum::<u64>(), 250);
     }
 
     #[test]
