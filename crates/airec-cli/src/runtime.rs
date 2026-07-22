@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airec_capture::{WindowsCaptureBackend, WindowsEncoderFactory};
+use airec_capture::{WindowsCaptureBackend, WindowsEncoderFactory, diagnose_encoders};
 use airec_core::{
     AirecError, CaptureBackend, CaptureFrame, CaptureTarget, ControlRequest, ControlResponse,
     EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor, InputEvent, InputSource,
@@ -297,10 +297,19 @@ fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
 
 fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
     let wgc = GraphicsCaptureApi::is_supported().unwrap_or(false);
+    let encoder = diagnose_encoders();
     let value = serde_json::json!({
         "wgc_supported": wgc,
         "capture_border_suppression": GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false),
-        "encoder": {"format": "H.264", "container": "FMPEG4", "hardware_preferred": true, "software_fallback": true},
+        "encoder": {
+            "format": "H.264",
+            "container": "FMPEG4",
+            "hardware_available": encoder.hardware_available,
+            "software_available": encoder.software_available,
+            "selected": encoder.selected,
+            "hardware_error": encoder.hardware_error,
+            "software_error": encoder.software_error,
+        },
         "audio": false,
         "network": false,
         "keyboard_hook": false,
@@ -309,15 +318,27 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
         println!("{value}");
     } else {
         println!("WGC: {}", if wgc { "supported" } else { "unavailable" });
-        println!("Encoder: H.264 FMPEG4 (hardware preferred, software fallback)");
+        println!(
+            "Encoder: H.264 FMPEG4 (selected: {})",
+            encoder.selected.unwrap_or("unavailable")
+        );
     }
-    if wgc {
+    if wgc && encoder.selected.is_some() {
         Ok(0)
-    } else {
+    } else if !wgc {
         Err((
             AirecError::new(
                 ErrorCode::CaptureInitFailed,
                 "Windows Graphics Capture is unavailable",
+                value,
+            ),
+            args.json,
+        ))
+    } else {
+        Err((
+            AirecError::new(
+                ErrorCode::EncoderUnavailable,
+                "no H.264 Media Foundation encoder is available",
                 value,
             ),
             args.json,
@@ -503,14 +524,30 @@ fn run_live(
     }
     let mut pipelines = Vec::new();
     let mut startup_failures = Vec::new();
+    let mut prepared = Vec::new();
     for target in targets {
+        match encoder_factory.create(&target, &options) {
+            Ok(encoder) => prepared.push((target, encoder)),
+            Err(error) => {
+                startup_failures.push((target.id.clone(), error));
+                if options.failure_policy == FailurePolicy::Abort {
+                    break;
+                }
+            }
+        }
+    }
+    if !startup_failures.is_empty() && options.failure_policy == FailurePolicy::Abort {
+        discard_prepared(prepared, pipelines);
+        return Err(startup_abort_error(&startup_failures));
+    }
+    for (target, encoder) in prepared.drain(..) {
         match create_pipeline(
             &backend,
-            &encoder_factory,
             &target,
             &options,
             mouse_hook.as_ref(),
             timeline_origin_ms.clone(),
+            encoder,
         ) {
             Ok(pipeline) => pipelines.push(pipeline),
             Err(error) => {
@@ -520,6 +557,10 @@ fn run_live(
                 }
             }
         }
+    }
+    if !startup_failures.is_empty() && options.failure_policy == FailurePolicy::Abort {
+        discard_prepared(prepared, pipelines);
+        return Err(startup_abort_error(&startup_failures));
     }
     if pipelines.is_empty() {
         return Err(startup_failures
@@ -533,19 +574,6 @@ fn run_live(
                     serde_json::json!({}),
                 )
             }));
-    }
-    if !startup_failures.is_empty() && options.failure_policy == FailurePolicy::Abort {
-        let failures: Vec<_> = startup_failures
-            .iter()
-            .map(|(target, error)| {
-                serde_json::json!({"target": target, "code": error.code, "message": error.message})
-            })
-            .collect();
-        return Err(AirecError::new(
-            ErrorCode::AbortedOnFailure,
-            "session aborted because a target failed to initialize",
-            serde_json::json!({"failures": failures, "stop_reason": "aborted_on_failure"}),
-        ));
     }
     let run_options = SessionRunOptions {
         session: session.clone(),
@@ -658,14 +686,20 @@ fn aggregate_startup_failures(
 
 fn create_pipeline(
     backend: &WindowsCaptureBackend,
-    encoder_factory: &WindowsEncoderFactory,
     target: &ResolvedTarget,
     options: &RecordingOptions,
     mouse_hook: Option<&MouseHook>,
     timeline_origin_ms: Arc<AtomicU64>,
+    encoder: Box<dyn airec_core::PipelineEncoder>,
 ) -> Result<Pipeline, AirecError> {
-    let source = backend.open(target, options)?;
-    let encoder = encoder_factory.create(target, options)?;
+    let source = match backend.open(target, options) {
+        Ok(source) => source,
+        Err(error) => {
+            drop(encoder);
+            let _ = std::fs::remove_file(&target.output);
+            return Err(error);
+        }
+    };
     let processor: Box<dyn FrameProcessor> = Box::new(ClickProcessor {
         target: target.clone(),
         enabled: options.effects,
@@ -686,6 +720,35 @@ fn create_pipeline(
         encoder,
         processor,
     })
+}
+
+fn startup_abort_error(startup_failures: &[(String, AirecError)]) -> AirecError {
+    let failures: Vec<_> = startup_failures
+        .iter()
+        .map(|(target, error)| {
+            serde_json::json!({"target": target, "code": error.code, "message": error.message})
+        })
+        .collect();
+    AirecError::new(
+        ErrorCode::AbortedOnFailure,
+        "session aborted because a target failed to initialize",
+        serde_json::json!({"failures": failures, "stop_reason": "aborted_on_failure"}),
+    )
+}
+
+fn discard_prepared(
+    prepared: Vec<(ResolvedTarget, Box<dyn airec_core::PipelineEncoder>)>,
+    pipelines: Vec<Pipeline>,
+) {
+    for (target, encoder) in prepared {
+        drop(encoder);
+        let _ = std::fs::remove_file(target.output);
+    }
+    for pipeline in pipelines {
+        let output = pipeline.output.clone();
+        drop(pipeline);
+        let _ = std::fs::remove_file(output);
+    }
 }
 
 struct ClickProcessor {

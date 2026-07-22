@@ -2,7 +2,7 @@
 
 mod encoder;
 
-pub use encoder::WindowsEncoderFactory;
+pub use encoder::{EncoderDiagnostics, WindowsEncoderFactory, diagnose_encoders};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -346,6 +346,7 @@ struct WgcFrameSource {
     alive: bool,
     hwnd: Option<isize>,
     dropped: Arc<AtomicU64>,
+    drop_baseline: Option<u64>,
 }
 
 impl Drop for WgcFrameSource {
@@ -362,7 +363,11 @@ impl FrameSource for WgcFrameSource {
         timeout: Duration,
     ) -> Result<Option<airec_core::CaptureFrame>, AirecError> {
         match self.receiver.recv_timeout(timeout) {
-            Ok(CaptureMessage::Frame(frame)) => Ok(Some(frame)),
+            Ok(CaptureMessage::Frame(frame)) => {
+                self.drop_baseline
+                    .get_or_insert_with(|| self.dropped.load(Ordering::Relaxed));
+                Ok(Some(frame))
+            }
             Ok(CaptureMessage::Closed) => {
                 self.alive = false;
                 Ok(None)
@@ -395,7 +400,9 @@ impl FrameSource for WgcFrameSource {
     }
 
     fn dropped_frames(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.drop_baseline.unwrap_or(0))
     }
 }
 
@@ -480,6 +487,7 @@ impl CaptureBackend for WindowsCaptureBackend {
             alive: true,
             hwnd: target.hwnd,
             dropped,
+            drop_baseline: None,
         }))
     }
 }

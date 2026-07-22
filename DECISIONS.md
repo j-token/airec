@@ -28,7 +28,7 @@ The encode resolution is fixed from the first frame. Later frame sizes are aspec
 
 ## D-007 — Fragmented MP4 and encoder fallback
 
-The encoder requests the Media Foundation `FMPEG4` container subtype rather than regular `MPEG4`, with video-only H.264. Hardware is tried first. On the first evidence sample, airec waits for Media Foundation's second video-sample request (proof that the first sample crossed the asynchronous transcoder) or an asynchronous failure. A failure before that readiness point removes the zero-frame output and retries the same first sample in software, with a stderr warning. After readiness, a failing encoder is never replaced over the same path, so fallback cannot truncate prior video. Failure of both startup paths is `ENCODER_UNAVAILABLE`.
+The encoder requests the Media Foundation `FMPEG4` container subtype rather than regular `MPEG4`, with video-only H.264. Before opening evidence files, airec completes a one-frame 1280×720 hardware transcode and waits for Media Foundation's second video-sample request, proving that the first sample crossed the asynchronous transcoder. The process caches that selection for all targets in the session. A failed hardware probe selects a similarly verified software path and emits a stderr warning. A synchronous failure while opening the real evidence encoder can still fall back only before any evidence frame is committed. After recording begins, an encoder is never replaced over the same path, so fallback cannot truncate prior video. Failure of both startup paths is `ENCODER_UNAVAILABLE`.
 
 ## D-008 — Input coordinate space
 
@@ -52,4 +52,8 @@ The PRD has no separate invalid-arguments error code. When clap validation fails
 
 ## D-013 — Recording timeline origin
 
-WGC frames and `WH_MOUSE_LL` events first use one monotonic epoch created before capture starts. The first delivered video frame establishes the public recording origin. Encoded frames, click compositing, and sidecar `t_ms` values all subtract that same origin; pre-roll input and input after the final video timestamp are omitted.
+WGC frames and `WH_MOUSE_LL` events first use one monotonic epoch created before capture starts. All target pipelines rendezvous after their first-frame attempt; the earliest successful first frame establishes the session origin. Every encoder preserves that absolute session timestamp instead of independently rebasing its first sample. Encoded frames, click compositing, and sidecar `t_ms` values therefore share one timeline even when targets start at different times; pre-roll input and input after the final video timestamp are omitted. `started` is published only after each successful pipeline's first sample crosses asynchronous encoder startup, so fallback diagnostics are available to the detached caller.
+
+## D-014 — Doctor encoder probe
+
+`doctor` performs complete one-frame 1280×720 FMPEG4 transcodes with hardware acceleration enabled and disabled. It reports both actual availability results and the selected mode. Temporary probe files are removed; if neither mode succeeds, the command returns `ENCODER_UNAVAILABLE` (exit 3).

@@ -72,12 +72,14 @@ pub fn run_session(
     }
     let target_count = pipelines.len();
     let (sender, receiver) = std::sync::mpsc::channel();
+    let first_frame_barrier = Arc::new(std::sync::Barrier::new(target_count));
     let mut handles = Vec::with_capacity(target_count);
     for pipeline in pipelines {
         let sender = sender.clone();
         let thread_options = options.clone();
+        let first_frame_barrier = first_frame_barrier.clone();
         handles.push(std::thread::spawn(move || {
-            run_pipeline(pipeline, thread_options, sender)
+            run_pipeline(pipeline, thread_options, sender, first_frame_barrier)
         }));
     }
     drop(sender);
@@ -185,10 +187,12 @@ fn run_pipeline(
     mut pipeline: Pipeline,
     options: SessionRunOptions,
     sender: std::sync::mpsc::Sender<PipelineMessage>,
+    first_frame_barrier: Arc<std::sync::Barrier>,
 ) {
     let first = match pipeline.source.next_frame(options.first_frame_timeout) {
         Ok(Some(frame)) => frame,
         Ok(None) if !pipeline.source.is_target_alive() => {
+            first_frame_barrier.wait();
             pipeline_failure(
                 &pipeline,
                 &options,
@@ -200,6 +204,7 @@ fn run_pipeline(
             return;
         }
         Ok(None) => {
+            first_frame_barrier.wait();
             pipeline_failure(
                 &pipeline,
                 &options,
@@ -210,6 +215,30 @@ fn run_pipeline(
             );
             return;
         }
+        Err(error) => {
+            first_frame_barrier.wait();
+            pipeline_failure(
+                &pipeline,
+                &options,
+                error.code,
+                &error.message,
+                StopReason::Error,
+                &sender,
+            );
+            return;
+        }
+    };
+    options
+        .timeline_origin_ms
+        .fetch_min(first.t_ms, Ordering::AcqRel);
+    first_frame_barrier.wait();
+
+    let session_started = Instant::now();
+    let origin = options.timeline_origin_ms.load(Ordering::Acquire);
+    let mut initial_frame = first.clone();
+    initial_frame.t_ms = first.t_ms.saturating_sub(origin.min(first.t_ms));
+    let initial_frame = match pipeline.processor.process(initial_frame) {
+        Ok(frame) => frame,
         Err(error) => {
             pipeline_failure(
                 &pipeline,
@@ -222,12 +251,17 @@ fn run_pipeline(
             return;
         }
     };
-    let _ = options.timeline_origin_ms.compare_exchange(
-        u64::MAX,
-        first.t_ms,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    if let Err(error) = pipeline.encoder.write_frame(&initial_frame) {
+        pipeline_failure(
+            &pipeline,
+            &options,
+            error.code,
+            &error.message,
+            StopReason::Error,
+            &sender,
+        );
+        return;
+    }
 
     let _ = sender.send(PipelineMessage::FirstFrame(TargetSummary {
         kind: pipeline.kind.clone(),
@@ -235,12 +269,11 @@ fn run_pipeline(
         file: pipeline.output.to_string_lossy().into_owned(),
     }));
 
-    let session_started = Instant::now();
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(options.fps.max(1)));
     let mut next_frame_at = Instant::now();
     let mut next_heartbeat = Instant::now() + options.heartbeat_interval;
     let mut last_frame = first;
-    let mut frames = 0_u64;
+    let mut frames = 1_u64;
     let stop_reason = loop {
         let elapsed = session_started.elapsed();
         let automatic_reason = if options.duration.is_some_and(|duration| elapsed >= duration) {
@@ -678,6 +711,34 @@ mod tests {
         let outcome = run_session(vec![pipeline], run_options, |_| {});
         assert_eq!(outcome.exit_code, 0);
         assert!(observed.lock().unwrap()[0] < 50);
+    }
+
+    #[test]
+    fn multiple_targets_preserve_first_frame_skew_on_one_session_timeline() {
+        let early_times = Arc::new(Mutex::new(Vec::new()));
+        let late_times = Arc::new(Mutex::new(Vec::new()));
+        let mut early_frame = frame();
+        early_frame.t_ms = 0;
+        let mut late_frame = frame();
+        late_frame.t_ms = 250;
+        let mut early = pipeline(MockSource {
+            frames: VecDeque::from([Some(early_frame), None]),
+            alive: true,
+        });
+        early.processor = Box::new(TimelineRecorder(early_times.clone()));
+        let mut late = pipeline(MockSource {
+            frames: VecDeque::from([Some(late_frame), None]),
+            alive: true,
+        });
+        late.target = "late.mp4".into();
+        late.output = "late.mp4".into();
+        late.processor = Box::new(TimelineRecorder(late_times.clone()));
+        let mut run_options = options(Duration::from_millis(5));
+        run_options.timeline_origin_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let outcome = run_session(vec![early, late], run_options, |_| {});
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(early_times.lock().unwrap()[0], 0);
+        assert_eq!(late_times.lock().unwrap()[0], 250);
     }
 
     #[test]

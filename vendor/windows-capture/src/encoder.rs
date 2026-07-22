@@ -1311,6 +1311,23 @@ impl VideoEncoder {
         Ok(())
     }
 
+    /// Sends a raw frame buffer using an absolute session timeline timestamp.
+    /// Unlike [`Self::send_frame_buffer`], this does not rebase the first sample to zero.
+    #[inline]
+    pub fn send_frame_buffer_at_timeline(&mut self, buffer: &[u8], timestamp: i64) -> Result<(), VideoEncoderError> {
+        if self.is_video_disabled {
+            return Err(VideoEncoderError::VideoDisabled);
+        }
+        self.frame_sender
+            .send(Some((VideoEncoderSource::Buffer(buffer.to_vec()), TimeSpan { Duration: timestamp })))?;
+        if self.error_notify.load(atomic::Ordering::Acquire)
+            && let Some(thread) = self.transcode_thread.take()
+        {
+            thread.join().expect("Failed to join transcode thread")?;
+        }
+        Ok(())
+    }
+
     /// Waits until Media Foundation requests its first video sample, proving that
     /// asynchronous encoder startup succeeded, or returns the startup error.
     pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), VideoEncoderError> {

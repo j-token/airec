@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use airec_core::{
     AirecError, CaptureFrame, EncoderFactory, ErrorCode, PipelineEncoder, RecordingOptions,
@@ -11,6 +12,94 @@ use windows_capture::encoder::{
 
 #[derive(Default)]
 pub struct WindowsEncoderFactory;
+
+#[derive(Clone)]
+enum PreferredEncoder {
+    Hardware,
+    Software {
+        hardware_error: String,
+    },
+    Unavailable {
+        hardware_error: String,
+        software_error: String,
+    },
+}
+
+static PREFERRED_ENCODER: OnceLock<PreferredEncoder> = OnceLock::new();
+
+fn preferred_encoder() -> PreferredEncoder {
+    PREFERRED_ENCODER
+        .get_or_init(|| match probe_encoder_mode(true) {
+            Ok(()) => PreferredEncoder::Hardware,
+            Err(hardware_error) => match probe_encoder_mode(false) {
+                Ok(()) => PreferredEncoder::Software {
+                    hardware_error: hardware_error.to_string(),
+                },
+                Err(software_error) => PreferredEncoder::Unavailable {
+                    hardware_error: hardware_error.to_string(),
+                    software_error: software_error.to_string(),
+                },
+            },
+        })
+        .clone()
+}
+
+#[derive(Clone, Debug)]
+pub struct EncoderDiagnostics {
+    pub hardware_available: bool,
+    pub software_available: bool,
+    pub selected: Option<&'static str>,
+    pub hardware_error: Option<String>,
+    pub software_error: Option<String>,
+}
+
+#[must_use]
+pub fn diagnose_encoders() -> EncoderDiagnostics {
+    let hardware = probe_encoder_mode(true);
+    let software = probe_encoder_mode(false);
+    EncoderDiagnostics {
+        hardware_available: hardware.is_ok(),
+        software_available: software.is_ok(),
+        selected: if hardware.is_ok() {
+            Some("hardware")
+        } else if software.is_ok() {
+            Some("software")
+        } else {
+            None
+        },
+        hardware_error: hardware.err().map(|error| error.to_string()),
+        software_error: software.err().map(|error| error.to_string()),
+    }
+}
+
+fn probe_encoder_mode(
+    hardware_acceleration: bool,
+) -> Result<(), windows_capture::encoder::VideoEncoderError> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mode = if hardware_acceleration { "hw" } else { "sw" };
+    let config = EncoderConfig {
+        path: std::env::temp_dir().join(format!(
+            "airec-doctor-{}-{nonce}-{mode}.mp4",
+            std::process::id()
+        )),
+        width: 1280,
+        height: 720,
+        fps: 30,
+        bitrate: 4_000_000,
+    };
+    let result = (|| {
+        let mut encoder = create_encoder(&config, hardware_acceleration)?;
+        let frame = vec![0_u8; config.width as usize * config.height as usize * 4];
+        encoder.send_frame_buffer_at_timeline(&frame, 0)?;
+        encoder.wait_until_ready(std::time::Duration::from_secs(2))?;
+        encoder.finish()
+    })();
+    let _ = std::fs::remove_file(&config.path);
+    result
+}
 
 impl EncoderFactory for WindowsEncoderFactory {
     fn create(
@@ -32,14 +121,33 @@ impl EncoderFactory for WindowsEncoderFactory {
             fps: options.fps,
             bitrate: options.quality.bitrate(width, height, options.fps),
         };
-        match create_encoder(&config, true) {
-            Ok(encoder) => Ok(Box::new(MfEncoder {
-                encoder: Some(encoder),
-                config,
-                hardware: true,
-                frames_written: 0,
-            })),
-            Err(hardware_error) => {
+        match preferred_encoder() {
+            PreferredEncoder::Hardware => match create_encoder(&config, true) {
+                Ok(encoder) => Ok(Box::new(MfEncoder {
+                    encoder: Some(encoder),
+                    config,
+                    hardware: true,
+                    frames_written: 0,
+                })),
+                Err(hardware_error) => {
+                    eprintln!(
+                        "warning: hardware H.264 encoder unavailable ({hardware_error}); falling back to software"
+                    );
+                    probe_encoder_mode(false).map_err(|software_error| {
+                        encoder_unavailable(&hardware_error, &software_error)
+                    })?;
+                    let encoder = create_encoder(&config, false).map_err(|software_error| {
+                        encoder_unavailable(&hardware_error, &software_error)
+                    })?;
+                    Ok(Box::new(MfEncoder {
+                        encoder: Some(encoder),
+                        config,
+                        hardware: false,
+                        frames_written: 0,
+                    }))
+                }
+            },
+            PreferredEncoder::Software { hardware_error } => {
                 eprintln!(
                     "warning: hardware H.264 encoder unavailable ({hardware_error}); falling back to software"
                 );
@@ -48,7 +156,7 @@ impl EncoderFactory for WindowsEncoderFactory {
                         ErrorCode::EncoderUnavailable,
                         "hardware and software H.264 encoders are unavailable",
                         serde_json::json!({
-                            "hardware": hardware_error.to_string(),
+                            "hardware": hardware_error,
                             "software": software_error.to_string(),
                         }),
                     )
@@ -60,6 +168,17 @@ impl EncoderFactory for WindowsEncoderFactory {
                     frames_written: 0,
                 }))
             }
+            PreferredEncoder::Unavailable {
+                hardware_error,
+                software_error,
+            } => Err(AirecError::new(
+                ErrorCode::EncoderUnavailable,
+                "hardware and software H.264 encoders are unavailable",
+                serde_json::json!({
+                    "hardware": hardware_error,
+                    "software": software_error,
+                }),
+            )),
         }
     }
 }
@@ -111,16 +230,7 @@ impl PipelineEncoder for MfEncoder {
             .encoder
             .as_mut()
             .expect("encoder exists until finish")
-            .send_frame_buffer(&packed, timestamp_hns)
-            .and_then(|()| {
-                if self.frames_written == 0 {
-                    self.encoder
-                        .as_mut()
-                        .expect("encoder exists until finish")
-                        .wait_until_ready(std::time::Duration::from_millis(500))?;
-                }
-                Ok(())
-            });
+            .send_frame_buffer_at_timeline(&packed, timestamp_hns);
         match first_result {
             Ok(()) => {
                 self.frames_written += 1;
@@ -137,7 +247,7 @@ impl PipelineEncoder for MfEncoder {
                         encoder_unavailable(&hardware_error, &software_error)
                     })?;
                 software
-                    .send_frame_buffer(&packed, timestamp_hns)
+                    .send_frame_buffer_at_timeline(&packed, timestamp_hns)
                     .and_then(|()| software.wait_until_ready(std::time::Duration::from_secs(1)))
                     .map_err(|software_error| {
                         encoder_unavailable(&hardware_error, &software_error)
