@@ -102,3 +102,11 @@ The deterministic 31-frame, 960×540, 10 FPS report benchmark runs with:
 | Full-frame change | 21,185,736 | 21,413,782 | 21,192,892 | -0.03% | 424.4797 | 416.0086 |
 
 The near-static evidence case clears both the required 90% and stretch 95% reductions. Localized change also clears both. Scroll and full-frame change deliberately do not trade fidelity for the size target; the fixed-palette fallback limits their growth while retaining slightly lower error. Tests independently parse LZW data, local palettes, transparency, and the composited canvas. A release conversion was also decoded as an 11-frame 960×544 GIF by Windows WIC and rendered by Chrome headless. GIF89a, Netscape looping, temporary-output commit, overwrite refusal, error mapping, dimensions, sampling rate, and existing `converted` JSONL fields remain unchanged.
+
+## D-022 — Skills CLI distribution layout
+
+The skill package moved from `skill/` to `skills/airec/`, superseding the location chosen in D-020. The Skills CLI (`npx skills`) discovers skills by walking a fixed set of container directories one level deep; `skills/` is on that list and `skill/` is not, so the previous layout was only reachable through the CLI's fallback recursive search. The CLI also requires the frontmatter `name` to match the parent directory name, which `skill/` violated while declaring `name: airec`.
+
+The directory name is therefore the installed skill name, and `npx skills add j-token/screen-recorder-cli --skill airec` is the supported install path. No manifest file is involved; the Skills CLI has no publish or registry step and resolves everything from the git repository layout.
+
+The repository's own agent skills under `.agents/skills` remain where they are. Those paths are also CLI discovery locations, so a bare `npx skills add j-token/screen-recorder-cli` lists them alongside `airec`; installing the recorder skill alone requires the `--skill airec` filter.

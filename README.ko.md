@@ -116,7 +116,13 @@ airec record --monitor all --on-failure abort      # 전체를 finalize하고 �
 
 `AMBIGUOUS_TARGET`은 후보 창 목록을 `data`에 함께 반환합니다. 에이전트가 추측하지 않고 스스로 질의를 좁힐 수 있습니다.
 
-`skill/SKILL.md`에 이 내용이 Claude Code 스킬로 정리돼 있습니다. 해당 디렉터리를 사용자 또는 프로젝트 스킬 위치에 복사하면 에이전트가 명령어와 `stop_reason` 판정 규칙을 아는 상태로 시작합니다.
+이 내용은 `skills/airec`에 에이전트 스킬로 정리돼 있습니다. 설치하면 에이전트가 명령어와 `stop_reason` 판정 규칙을 아는 상태로 시작합니다.
+
+```powershell
+npx skills add j-token/screen-recorder-cli --skill airec
+```
+
+`-g`를 붙이면 현재 프로젝트가 아니라 전체 프로젝트에 설치됩니다. `--skill airec`을 빼면 이 저장소의 내부 워크플로 스킬까지 함께 목록에 잡히는데, 그건 녹화기와 무관합니다.
 
 ## 포인터 효과
 
