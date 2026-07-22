@@ -18,11 +18,30 @@ It has no GUI, no audio capture, no network access, no upload feature, no keyboa
 
 > Recordings can contain passwords, tokens, and personal data. Review one before you share it. UAC secure-desktop and DRM-protected content are not bypassed and will appear black.
 
-## Requirements
+## Install
 
-Windows 10 version 2004 or later, or Windows 11. Rust 1.85 or later to build.
+Windows 10 version 2004 or later, or Windows 11, on x86_64.
 
-There is no prebuilt binary yet, so build from source:
+```powershell
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+```
+
+That takes the latest release, checks its SHA256, drops `airec.exe` in `%LOCALAPPDATA%\airec\bin`, and puts that directory on your user PATH. No admin rights, no Rust toolchain, nothing to compile. Open a new terminal afterwards so the PATH change applies.
+
+To pin a version, install elsewhere, or remove it, run the script as a scriptblock so it can take arguments:
+
+```powershell
+$s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1))
+& $s -Version v0.2.2
+& $s -InstallDir D:\tools\airec
+& $s -Uninstall
+```
+
+Uninstalling removes the executable and the PATH entry, and leaves your recordings and `airec.toml` alone.
+
+If piping a script into your shell is not something you want to do, take the zip from the [releases page](https://github.com/j-token/airec/releases), verify it against the `.sha256` next to it, and put `airec.exe` anywhere on your PATH.
+
+Building from source needs Rust 1.85 or later:
 
 ```powershell
 cargo build --release
@@ -119,10 +138,11 @@ Errors are structured, and the exit code matches the code:
 All of this is packaged as an agent skill under `skills/airec`, so the agent starts out knowing the commands and the `stop_reason` rule:
 
 ```powershell
-npx skills add j-token/screen-recorder-cli --skill airec
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+npx skills add j-token/airec --skill airec
 ```
 
-Add `-g` to install it for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
+The skill is instructions, not the recorder, so the first line is not optional: install the CLI too or the agent will call a command that does not exist. Add `-g` to the second line to install the skill for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
 
 ## Pointer effects
 

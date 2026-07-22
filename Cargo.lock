@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "airec-capture"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "airec-core",
  "crossbeam-channel",
@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "airec-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "airec-capture",
  "airec-core",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "airec-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "serde",
@@ -47,14 +47,14 @@ dependencies = [
 
 [[package]]
 name = "airec-effects"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "airec-core",
 ]
 
 [[package]]
 name = "airec-input"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "airec-core",
  "crossbeam-channel",

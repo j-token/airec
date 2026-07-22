@@ -7,6 +7,18 @@ description: Record Windows screen evidence with the airec CLI, inspect JSONL se
 
 Use `airec` only for explicit evidence tasks. It records pixels and mouse activity locally; it never needs network access and must not be used to collect keyboard input. Recordings can contain passwords, access tokens, personal data, and other sensitive screen content: review every output before sharing or uploading it. UAC secure-desktop and DRM-protected content may appear black and should not be treated as complete evidence.
 
+## Install the CLI
+
+This skill is instructions only; `airec.exe` is a separate download. If `airec --version` fails, install it before doing anything else:
+
+```powershell
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+```
+
+The script verifies the release checksum, installs to `%LOCALAPPDATA%\airec\bin`, and adds that directory to the user PATH. It needs no administrator rights and no Rust toolchain. PATH changes do not reach an already-running shell, so in the current session invoke the executable by its full path, `$env:LOCALAPPDATA\airec\bin\airec.exe`, until a new shell is started.
+
+Requires Windows 10 version 2004 or later on x86_64. Do not install by building from source unless the user asks for it; a release build takes minutes.
+
 ## Choose the failure policy
 
 - Use `--on-failure continue` when evidence from the targets that remain available is still useful. A partial multi-target result exits with code 6, so retain the successful files listed in the error data.
