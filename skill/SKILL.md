@@ -5,7 +5,7 @@ description: Record Windows screen evidence with the airec CLI, inspect JSONL se
 
 # airec evidence recording
 
-Use `airec` only for explicit evidence tasks. It records pixels and mouse activity locally; it never needs network access and must not be used to collect keyboard input.
+Use `airec` only for explicit evidence tasks. It records pixels and mouse activity locally; it never needs network access and must not be used to collect keyboard input. Recordings can contain passwords, access tokens, personal data, and other sensitive screen content: review every output before sharing or uploading it. UAC secure-desktop and DRM-protected content may appear black and should not be treated as complete evidence.
 
 ## Choose the failure policy
 
