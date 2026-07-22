@@ -56,9 +56,9 @@ pub struct RecordArgs {
     pub targets: TargetArgs,
     #[command(flatten)]
     pub recording: RecordingArgs,
-    /// Required foreground recording duration, for example 30s or 2m.
+    /// Foreground recording duration, for example 30s or 2m; omit to use Ctrl+C.
     #[arg(long)]
-    pub duration: String,
+    pub duration: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -197,5 +197,14 @@ mod tests {
         assert!(
             Cli::try_parse_from(["airec", "record", "--duration", "1s", "--fps", "61"]).is_err()
         );
+    }
+
+    #[test]
+    fn record_duration_is_optional_for_ctrl_c_mode() {
+        let cli = Cli::try_parse_from(["airec", "record", "--no-effects"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record")
+        };
+        assert!(args.duration.is_none());
     }
 }

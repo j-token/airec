@@ -8,7 +8,7 @@ Every event has `event`, `ts`, `session`, and `target`. `started` is session-wid
 
 ## D-002 — Detached command event ownership
 
-`start` returns after proxying the child session's `started` event. `record` owns and emits live `heartbeat` events. `stop` proxies terminal `target_lost`, `saved`, and `error` events after finalization. `status` returns the latest persisted state, including sessions that ended automatically. A detached child never inherits the caller's stdout/stderr handles.
+`start` returns after proxying the child session's `started` event. `record` owns and emits live `heartbeat` events. `stop` proxies terminal `target_lost`, `saved`, and `error` events after finalization. `status` reports active sessions only, as FR-006 specifies. A detached child never inherits the caller's stdout/stderr handles; startup diagnostics are written to a per-session local log and replayed to the `start` caller's stderr before it returns.
 
 ## D-003 — Window closure
 
@@ -28,7 +28,7 @@ The encode resolution is fixed from the first frame. Later frame sizes are aspec
 
 ## D-007 — Fragmented MP4 and encoder fallback
 
-The encoder requests the Media Foundation `FMPEG4` container subtype rather than regular `MPEG4`, with video-only H.264. Hardware acceleration is attempted first. If initialization fails, airec retries with hardware acceleration disabled and reports the fallback on stderr. Failure of both attempts is `ENCODER_UNAVAILABLE`.
+The encoder requests the Media Foundation `FMPEG4` container subtype rather than regular `MPEG4`, with video-only H.264. Hardware is tried first. On the first evidence sample, airec waits for Media Foundation's second video-sample request (proof that the first sample crossed the asynchronous transcoder) or an asynchronous failure. A failure before that readiness point removes the zero-frame output and retries the same first sample in software, with a stderr warning. After readiness, a failing encoder is never replaced over the same path, so fallback cannot truncate prior video. Failure of both startup paths is `ENCODER_UNAVAILABLE`.
 
 ## D-008 — Input coordinate space
 
@@ -36,8 +36,20 @@ The process opts into Per-Monitor-V2 DPI awareness. Mouse-hook screen coordinate
 
 ## D-009 — Session discovery
 
-Named pipes remain the control transport (`\\.\pipe\airec-<session-id>`). Small local state files under the user's temporary directory are only a discovery index and crash-recovery status cache; they contain session metadata and output paths, never captured pixels or input beyond an explicitly requested event log.
+Named pipes remain the control transport (`\\.\pipe\airec-<session-id>`). Small local state files under the user's temporary directory are only a discovery index and crash-recovery status cache; they contain session metadata and output paths, never captured pixels or input beyond an explicitly requested event log. Normal `stop` removes launch, state, and diagnostic metadata; discovery prunes completed entries. Crash remnants are retained as recovery evidence but are never treated as active without a reachable pipe.
 
 ## D-010 — Odd capture dimensions
 
 H.264 4:2:0 encoders require even dimensions. If a monitor or window has an odd physical dimension, the fixed session canvas is expanded by one black pixel on that axis. The captured content is not cropped or distorted.
+
+## D-011 — Multi-target output templates
+
+For multi-target capture, `--out` is a template only when it contains the literal `{target}` placeholder. The placeholder expands to the stable target id, such as `monitor-2` or `my-app-1a2b`. A multi-target `--out` without that placeholder is `OUTPUT_IO_ERROR`; `--out-dir` remains the simpler alternative.
+
+## D-012 — CLI validation in JSON mode
+
+The PRD has no separate invalid-arguments error code. When clap validation fails and `--json` is present, airec emits one `CAPTURE_INIT_FAILED` event with `data.component = "cli"` and exits 3. Help and version remain ordinary successful text output. This keeps every machine-mode error inside the published §13 code set.
+
+## D-013 — Recording timeline origin
+
+WGC frames and `WH_MOUSE_LL` events first use one monotonic epoch created before capture starts. The first delivered video frame establishes the public recording origin. Encoded frames, click compositing, and sidecar `t_ms` values all subtract that same origin; pre-roll input and input after the final video timestamp are omitted.

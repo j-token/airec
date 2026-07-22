@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,10 @@ pub struct Pipeline {
 #[derive(Clone)]
 pub struct SessionRunOptions {
     pub session: String,
+    /// Shared epoch for captured frames, mouse input, effects, and sidecar events.
+    pub timeline_started_at: Instant,
+    /// Millisecond offset of the first frame within the shared epoch.
+    pub timeline_origin_ms: Arc<AtomicU64>,
     pub fps: u32,
     pub first_frame_timeout: Duration,
     pub duration: Option<Duration>,
@@ -42,7 +47,7 @@ pub struct SessionOutcome {
 enum PipelineMessage {
     FirstFrame(TargetSummary),
     Event(Event),
-    Failure(FailureRecord),
+    Failure(FailureRecord, StopReason),
     Complete(SuccessRecord),
 }
 
@@ -81,6 +86,7 @@ pub fn run_session(
     let mut started_targets = Vec::new();
     let mut successes = Vec::new();
     let mut failures = Vec::new();
+    let mut failure_reasons = Vec::new();
     let mut completed = 0;
     let mut started_emitted = false;
     let mut startup_resolved = 0;
@@ -99,11 +105,12 @@ pub fn run_session(
                 emit(&event);
                 events.push(event);
             }
-            PipelineMessage::Failure(failure) => {
+            PipelineMessage::Failure(failure, stop_reason) => {
                 if startup_targets.insert(failure.target.clone()) {
                     startup_resolved += 1;
                 }
                 failures.push(failure);
+                failure_reasons.push(stop_reason);
                 completed += 1;
                 if options.failure_policy == FailurePolicy::Abort {
                     set_stop(&options.stop, StopReason::AbortedOnFailure);
@@ -152,10 +159,17 @@ pub fn run_session(
     };
     if let Some(error) = &error {
         let stop_reason = match error.code {
-            ErrorCode::AbortedOnFailure => Some(StopReason::AbortedOnFailure),
-            _ => Some(StopReason::Error),
+            ErrorCode::AbortedOnFailure => StopReason::AbortedOnFailure,
+            _ if successes.is_empty()
+                && failure_reasons
+                    .first()
+                    .is_some_and(|first| failure_reasons.iter().all(|reason| reason == first)) =>
+            {
+                failure_reasons[0]
+            }
+            _ => StopReason::Error,
         };
-        let event = error_event(&options.session, None, error, stop_reason);
+        let event = error_event(&options.session, None, error, Some(stop_reason));
         emit(&event);
         events.push(event);
     }
@@ -208,6 +222,12 @@ fn run_pipeline(
             return;
         }
     };
+    let _ = options.timeline_origin_ms.compare_exchange(
+        u64::MAX,
+        first.t_ms,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 
     let _ = sender.send(PipelineMessage::FirstFrame(TargetSummary {
         kind: pipeline.kind.clone(),
@@ -221,7 +241,6 @@ fn run_pipeline(
     let mut next_heartbeat = Instant::now() + options.heartbeat_interval;
     let mut last_frame = first;
     let mut frames = 0_u64;
-    let dropped = 0_u64;
     let stop_reason = loop {
         let elapsed = session_started.elapsed();
         let automatic_reason = if options.duration.is_some_and(|duration| elapsed >= duration) {
@@ -264,7 +283,9 @@ fn run_pipeline(
             }
         }
         let mut paced_frame = last_frame.clone();
-        paced_frame.t_ms = session_started.elapsed().as_millis() as u64;
+        let origin = options.timeline_origin_ms.load(Ordering::Acquire);
+        let raw_t_ms = options.timeline_started_at.elapsed().as_millis() as u64;
+        paced_frame.t_ms = raw_t_ms.saturating_sub(origin.min(raw_t_ms));
         let processed = match pipeline.processor.process(paced_frame) {
             Ok(frame) => frame,
             Err(error) => {
@@ -298,7 +319,7 @@ fn run_pipeline(
                 target: pipeline.target.clone(),
                 elapsed_ms: session_started.elapsed().as_millis() as u64,
                 frames,
-                dropped,
+                dropped: pipeline.source.dropped_frames(),
                 minimized: Some(pipeline.source.is_minimized()),
             };
             let _ = sender.send(PipelineMessage::Event(event));
@@ -341,11 +362,14 @@ fn run_pipeline(
         } else {
             ErrorCode::CaptureInitFailed
         };
-        let _ = sender.send(PipelineMessage::Failure(FailureRecord {
-            target: pipeline.target,
-            code,
-            message: format!("pipeline ended with {stop_reason:?}"),
-        }));
+        let _ = sender.send(PipelineMessage::Failure(
+            FailureRecord {
+                target: pipeline.target,
+                code,
+                message: format!("pipeline ended with {stop_reason:?}"),
+            },
+            stop_reason,
+        ));
     }
 }
 
@@ -364,11 +388,14 @@ fn pipeline_failure(
         &error,
         Some(stop_reason),
     )));
-    let _ = sender.send(PipelineMessage::Failure(FailureRecord {
-        target: pipeline.target.clone(),
-        code,
-        message: message.into(),
-    }));
+    let _ = sender.send(PipelineMessage::Failure(
+        FailureRecord {
+            target: pipeline.target.clone(),
+            code,
+            message: message.into(),
+        },
+        stop_reason,
+    ));
 }
 
 fn error_event(
@@ -412,6 +439,7 @@ fn _path_as_target(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
 
     use super::*;
     use crate::CaptureFrame;
@@ -446,6 +474,35 @@ mod tests {
         }
     }
 
+    struct DroppedSource(MockSource);
+
+    impl FrameSource for DroppedSource {
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<CaptureFrame>, AirecError> {
+            self.0.next_frame(timeout)
+        }
+        fn is_target_alive(&self) -> bool {
+            self.0.is_target_alive()
+        }
+        fn is_minimized(&self) -> bool {
+            false
+        }
+        fn dropped_frames(&self) -> u64 {
+            7
+        }
+    }
+
+    struct TimelineRecorder(Arc<Mutex<Vec<u64>>>);
+
+    impl FrameProcessor for TimelineRecorder {
+        fn process(&mut self, frame: CaptureFrame) -> Result<CaptureFrame, AirecError> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.t_ms);
+            Ok(frame)
+        }
+    }
+
     fn frame() -> CaptureFrame {
         CaptureFrame {
             width: 2,
@@ -471,6 +528,8 @@ mod tests {
     fn options(duration: Duration) -> SessionRunOptions {
         SessionRunOptions {
             session: "test".into(),
+            timeline_started_at: Instant::now(),
+            timeline_origin_ms: Arc::new(AtomicU64::new(u64::MAX)),
             fps: 60,
             first_frame_timeout: Duration::ZERO,
             duration: Some(duration),
@@ -530,6 +589,13 @@ mod tests {
             event,
             Event::TargetLost {
                 stop_reason: StopReason::TargetLost,
+                ..
+            }
+        )));
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            Event::Error {
+                stop_reason: Some(StopReason::TargetLost),
                 ..
             }
         )));
@@ -595,5 +661,45 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn shared_timeline_epoch_survives_first_frame_delay() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut delayed_frame = frame();
+        delayed_frame.t_ms = 250;
+        let mut pipeline = pipeline(MockSource {
+            frames: VecDeque::from([Some(delayed_frame), None]),
+            alive: true,
+        });
+        pipeline.processor = Box::new(TimelineRecorder(observed.clone()));
+        let mut run_options = options(Duration::from_millis(5));
+        run_options.timeline_started_at = Instant::now() - Duration::from_millis(250);
+        let outcome = run_session(vec![pipeline], run_options, |_| {});
+        assert_eq!(outcome.exit_code, 0);
+        assert!(observed.lock().unwrap()[0] < 50);
+    }
+
+    #[test]
+    fn heartbeat_reports_capture_transport_drops() {
+        let pipeline = Pipeline {
+            target: "mock.mp4".into(),
+            kind: "monitor".into(),
+            title: None,
+            output: "mock.mp4".into(),
+            source: Box::new(DroppedSource(MockSource {
+                frames: VecDeque::from([Some(frame()), None]),
+                alive: true,
+            })),
+            encoder: Box::new(MockEncoder),
+            processor: Box::new(()),
+        };
+        let outcome = run_session(vec![pipeline], options(Duration::from_millis(5)), |_| {});
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Heartbeat { dropped: 7, .. }))
+        );
     }
 }

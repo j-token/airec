@@ -1,17 +1,18 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airec_capture::{WindowsCaptureBackend, WindowsEncoderFactory};
 use airec_core::{
     AirecError, CaptureBackend, CaptureFrame, CaptureTarget, ControlRequest, ControlResponse,
-    EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor, InputSource, Pipeline,
-    Quality, RecordingOptions, ResolvedTarget, SessionRunOptions, SessionSnapshot, SessionState,
-    StopReason, TargetCatalog, TargetKind, TargetSnapshot, Timestamp, run_session,
+    EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor, InputEvent, InputSource,
+    Pipeline, Quality, RecordingOptions, ResolvedTarget, SessionOutcome, SessionRunOptions,
+    SessionSnapshot, SessionState, StopReason, TargetCatalog, TargetKind, TargetSnapshot,
+    Timestamp, run_session,
 };
 use airec_effects::{RippleCompositor, ScreenRect, letterbox};
 use airec_input::{EventLogWriter, MouseHook, MouseSubscription};
@@ -113,7 +114,12 @@ fn list(kind: ListKind) -> Result<i32, (AirecError, bool)> {
 }
 
 fn record(args: RecordArgs) -> Result<i32, (AirecError, bool)> {
-    let duration = parse_duration(&args.duration).map_err(|error| (error, args.json))?;
+    let duration = args
+        .duration
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|error| (error, args.json))?;
     let (targets, options) =
         prepare(&args.targets, &args.recording).map_err(|error| (error, args.json))?;
     let session = short_session_id();
@@ -134,16 +140,8 @@ fn record(args: RecordArgs) -> Result<i32, (AirecError, bool)> {
             args.json,
         )
     })?;
-    run_live(
-        session,
-        targets,
-        options,
-        Some(duration),
-        stop,
-        args.json,
-        None,
-    )
-    .map_err(|error| (error, args.json))
+    run_live(session, targets, options, duration, stop, args.json, None)
+        .map_err(|error| (error, args.json))
 }
 
 fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
@@ -176,6 +174,7 @@ fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
                 .iter()
                 .find(|event| matches!(event, Event::Started { .. }))
             {
+                print_detached_diagnostics(&session);
                 print_event(started, args.json);
                 return Ok(0);
             }
@@ -183,6 +182,7 @@ fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
                 state.snapshot.state,
                 SessionState::Failed | SessionState::Finished
             ) {
+                print_detached_diagnostics(&session);
                 for event in &state.events {
                     print_event(event, args.json);
                 }
@@ -277,6 +277,7 @@ fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
             for event in &events {
                 print_event(event, args.json);
             }
+            remove_session_metadata(&session);
             Ok(exit_code)
         }
         ControlResponse::Error { code, message } => Err((
@@ -326,6 +327,7 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
 
 fn session_child(config_path: &Path) -> Result<i32, AirecError> {
     let launch: LaunchConfig = read_json_file(config_path)?;
+    let _diagnostics = install_diagnostic_stderr(&launch.session)?;
     let path = state_path(&launch.session)?;
     let stop = Arc::new(Mutex::new(None));
     let initial = StateFile {
@@ -361,50 +363,58 @@ fn session_child(config_path: &Path) -> Result<i32, AirecError> {
     let server_shared = shared.clone();
     let server_stop = stop.clone();
     let server_session = launch.session.clone();
+    let response_shared = shared.clone();
     std::thread::spawn(move || {
-        let _ = ipc::serve(server_session, move |request| match request {
-            ControlRequest::Status => {
-                let state = server_shared
-                    .value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ControlResponse::Status {
-                    session: state.snapshot.clone(),
-                }
-            }
-            ControlRequest::Stop => {
-                *server_stop
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(StopReason::Requested);
-                loop {
-                    {
-                        let state = server_shared
-                            .value
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(exit_code) = state.exit_code {
-                            server_shared.response_sent.store(true, Ordering::Release);
-                            let events = state
-                                .events
-                                .iter()
-                                .filter(|event| {
-                                    matches!(
-                                        event,
-                                        Event::TargetLost { .. }
-                                            | Event::Saved { .. }
-                                            | Event::Error { .. }
-                                    )
-                                })
-                                .cloned()
-                                .collect();
-                            return ControlResponse::Events { events, exit_code };
-                        }
+        let _ = ipc::serve(
+            server_session,
+            move |request| match request {
+                ControlRequest::Status => {
+                    let state = server_shared
+                        .value
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    ControlResponse::Status {
+                        session: state.snapshot.clone(),
                     }
-                    std::thread::sleep(Duration::from_millis(20));
                 }
-            }
-        });
+                ControlRequest::Stop => {
+                    *server_stop
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(StopReason::Requested);
+                    loop {
+                        {
+                            let state = server_shared
+                                .value
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(exit_code) = state.exit_code {
+                                let events = state
+                                    .events
+                                    .iter()
+                                    .filter(|event| {
+                                        matches!(
+                                            event,
+                                            Event::TargetLost { .. }
+                                                | Event::Saved { .. }
+                                                | Event::Error { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect();
+                                return ControlResponse::Events { events, exit_code };
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            },
+            move |response| {
+                if matches!(response, ControlResponse::Events { .. }) {
+                    response_shared.response_sent.store(true, Ordering::Release);
+                }
+            },
+        );
     });
 
     let options = RecordingOptions {
@@ -475,6 +485,7 @@ fn run_live(
     let backend = WindowsCaptureBackend::new();
     let encoder_factory = WindowsEncoderFactory;
     let need_input = options.effects || options.event_log.is_some();
+    let timeline_origin_ms = Arc::new(AtomicU64::new(u64::MAX));
     let mouse_hook = if need_input {
         Some(MouseHook::install(options.started_at)?)
     } else {
@@ -499,6 +510,7 @@ fn run_live(
             &target,
             &options,
             mouse_hook.as_ref(),
+            timeline_origin_ms.clone(),
         ) {
             Ok(pipeline) => pipelines.push(pipeline),
             Err(error) => {
@@ -537,6 +549,8 @@ fn run_live(
     }
     let run_options = SessionRunOptions {
         session: session.clone(),
+        timeline_started_at: options.started_at,
+        timeline_origin_ms: timeline_origin_ms.clone(),
         fps: options.fps,
         first_frame_timeout: options.first_frame_timeout,
         duration,
@@ -565,35 +579,81 @@ fn run_live(
     if let (Some(path), Some(hook)) = (&options.event_log, mouse_hook.as_ref()) {
         let mut writer = EventLogWriter::create(path)?;
         let mut subscription = hook.subscribe();
-        for event in subscription.drain_until(u64::MAX) {
-            writer.write(&event)?;
-        }
-    }
-    if !startup_failures.is_empty() {
-        let saved: Vec<_> = outcome
+        let origin = timeline_origin_ms.load(Ordering::Acquire);
+        let video_end_ms = outcome
             .events
             .iter()
             .filter_map(|event| match event {
-                Event::Saved { target, file, .. } => {
-                    Some(serde_json::json!({"target": target, "file": file}))
-                }
+                Event::Saved { duration_ms, .. } => Some(*duration_ms),
                 _ => None,
             })
-            .collect();
-        let failed: Vec<_> = startup_failures
-            .iter()
-            .map(|(target, error)| serde_json::json!({"target": target, "code": error.code, "message": error.message}))
-            .collect();
-        let aggregate = AirecError::new(
-            ErrorCode::PartialFailure,
-            "one or more targets failed while remaining targets were saved",
-            serde_json::json!({"successes": saved, "failures": failed}),
-        );
+            .max()
+            .unwrap_or(0);
+        for event in subscription.drain_until(origin.saturating_add(video_end_ms)) {
+            if let Some(event) = normalize_input_event(event, origin) {
+                writer.write(&event)?;
+            }
+        }
+    }
+    if let Some(aggregate) = aggregate_startup_failures(&startup_failures, &outcome) {
         let event = error_to_event(&session, &aggregate);
         emit_runtime_event(&output_shared, json, &event);
         return Ok(ErrorCode::PartialFailure.exit_code());
     }
     Ok(outcome.exit_code)
+}
+
+fn aggregate_startup_failures(
+    startup_failures: &[(String, AirecError)],
+    outcome: &SessionOutcome,
+) -> Option<AirecError> {
+    if startup_failures.is_empty() {
+        return None;
+    }
+    let saved: Vec<_> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Saved {
+                target,
+                file,
+                stop_reason,
+                ..
+            } if stop_reason.is_intended() => {
+                Some(serde_json::json!({"target": target, "file": file}))
+            }
+            _ => None,
+        })
+        .collect();
+    if saved.is_empty() {
+        return None;
+    }
+    let mut failed: Vec<_> = startup_failures
+        .iter()
+        .map(|(target, error)| {
+            serde_json::json!({"target": target, "code": error.code, "message": error.message})
+        })
+        .collect();
+    if let Some(error) = &outcome.error {
+        if let Some(runtime_failures) = error
+            .data
+            .get("failures")
+            .and_then(|value| value.as_array())
+        {
+            failed.extend(runtime_failures.iter().cloned());
+        } else {
+            failed.push(serde_json::json!({
+                "target": error.data.get("target").cloned().unwrap_or(serde_json::Value::Null),
+                "code": error.code,
+                "message": error.message,
+            }));
+        }
+    }
+    Some(AirecError::new(
+        ErrorCode::PartialFailure,
+        "one or more targets failed while remaining targets were saved",
+        serde_json::json!({"successes": saved, "failures": failed}),
+    ))
 }
 
 fn create_pipeline(
@@ -602,6 +662,7 @@ fn create_pipeline(
     target: &ResolvedTarget,
     options: &RecordingOptions,
     mouse_hook: Option<&MouseHook>,
+    timeline_origin_ms: Arc<AtomicU64>,
 ) -> Result<Pipeline, AirecError> {
     let source = backend.open(target, options)?;
     let encoder = encoder_factory.create(target, options)?;
@@ -609,6 +670,7 @@ fn create_pipeline(
         target: target.clone(),
         enabled: options.effects,
         input: mouse_hook.map(MouseHook::subscribe),
+        timeline_origin_ms,
         compositor: RippleCompositor::default(),
     });
     Ok(Pipeline {
@@ -630,7 +692,46 @@ struct ClickProcessor {
     target: ResolvedTarget,
     enabled: bool,
     input: Option<MouseSubscription>,
+    timeline_origin_ms: Arc<AtomicU64>,
     compositor: RippleCompositor,
+}
+
+fn normalize_input_event(event: InputEvent, origin_ms: u64) -> Option<InputEvent> {
+    if origin_ms == u64::MAX {
+        return None;
+    }
+    match event {
+        InputEvent::Click {
+            t_ms,
+            button,
+            x,
+            y,
+            double,
+        } => Some(InputEvent::Click {
+            t_ms: t_ms.checked_sub(origin_ms)?,
+            button,
+            x,
+            y,
+            double,
+        }),
+        InputEvent::DragStart { t_ms, button, x, y } => Some(InputEvent::DragStart {
+            t_ms: t_ms.checked_sub(origin_ms)?,
+            button,
+            x,
+            y,
+        }),
+        InputEvent::DragEnd { t_ms, button, x, y } => Some(InputEvent::DragEnd {
+            t_ms: t_ms.checked_sub(origin_ms)?,
+            button,
+            x,
+            y,
+        }),
+        InputEvent::Move { t_ms, x, y } => Some(InputEvent::Move {
+            t_ms: t_ms.checked_sub(origin_ms)?,
+            x,
+            y,
+        }),
+    }
 }
 
 impl FrameProcessor for ClickProcessor {
@@ -638,7 +739,12 @@ impl FrameProcessor for ClickProcessor {
         if self.enabled
             && let Some(input) = &mut self.input
         {
-            let events = input.drain_until(frame.t_ms);
+            let origin = self.timeline_origin_ms.load(Ordering::Acquire);
+            let events = input
+                .drain_until(frame.t_ms.saturating_add(origin))
+                .into_iter()
+                .filter_map(|event| normalize_input_event(event, origin))
+                .collect::<Vec<_>>();
             if let Some((clip, mapping)) = target_viewport(&self.target) {
                 self.compositor
                     .push_events_mapped(events, clip, mapping, &frame);
@@ -960,6 +1066,10 @@ fn state_path(session: &str) -> Result<PathBuf, AirecError> {
     Ok(session_directory()?.join(format!("{session}.json")))
 }
 
+fn diagnostics_path(session: &str) -> Result<PathBuf, AirecError> {
+    Ok(session_directory()?.join(format!("diagnostics-{session}.log")))
+}
+
 fn session_states() -> Result<Vec<StateFile>, AirecError> {
     let directory = session_directory()?;
     let entries = std::fs::read_dir(&directory).map_err(|error| {
@@ -978,21 +1088,34 @@ fn session_states() -> Result<Vec<StateFile>, AirecError> {
 
 fn active_sessions() -> Result<Vec<SessionSnapshot>, AirecError> {
     let states = session_states()?;
-    Ok(states
-        .into_iter()
-        .filter(|state| {
-            matches!(
-                state.snapshot.state,
-                SessionState::Starting | SessionState::Recording | SessionState::Stopping
-            )
-        })
-        .filter_map(
-            |state| match ipc::request(&state.snapshot.session, &ControlRequest::Status) {
-                Ok(ControlResponse::Status { session }) => Some(session),
-                _ => None,
-            },
-        )
-        .collect())
+    let mut active = Vec::new();
+    for state in states {
+        let session_id = state.snapshot.session.clone();
+        let is_active = matches!(
+            state.snapshot.state,
+            SessionState::Starting | SessionState::Recording | SessionState::Stopping
+        );
+        if !is_active {
+            remove_session_metadata(&session_id);
+        } else if let Ok(ControlResponse::Status { session }) =
+            ipc::request(&session_id, &ControlRequest::Status)
+        {
+            active.push(session);
+        }
+    }
+    Ok(active)
+}
+
+fn remove_session_metadata(session: &str) {
+    if let Ok(directory) = session_directory() {
+        for path in [
+            directory.join(format!("{session}.json")),
+            directory.join(format!("launch-{session}.json")),
+            directory.join(format!("diagnostics-{session}.log")),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn persist_state(shared: &SharedState) -> Result<(), AirecError> {
@@ -1073,6 +1196,48 @@ fn spawn_detached(config: &Path) -> Result<(), AirecError> {
         })
 }
 
+fn install_diagnostic_stderr(session: &str) -> Result<File, AirecError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    let path = diagnostics_path(session)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .share_mode(0x1 | 0x2 | 0x4)
+        .open(&path)
+        .map_err(|error| {
+            AirecError::new(
+                ErrorCode::OutputIoError,
+                error.to_string(),
+                serde_json::json!({"path": path}),
+            )
+        })?;
+    unsafe {
+        SetStdHandle(STD_ERROR_HANDLE, HANDLE(file.as_raw_handle())).map_err(|error| {
+            AirecError::new(
+                ErrorCode::OutputIoError,
+                error.to_string(),
+                serde_json::json!({"path": path}),
+            )
+        })?;
+    }
+    Ok(file)
+}
+
+fn print_detached_diagnostics(session: &str) {
+    if let Ok(path) = diagnostics_path(session)
+        && let Ok(contents) = std::fs::read_to_string(path)
+        && !contents.is_empty()
+    {
+        eprint!("{contents}");
+    }
+}
+
 fn short_session_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
 }
@@ -1102,6 +1267,97 @@ mod tests {
         assert_eq!(
             target_specs(&TargetArgs::default()).unwrap(),
             [CaptureTarget::PrimaryMonitor]
+        );
+    }
+
+    #[test]
+    fn startup_failure_is_not_partial_success_when_no_pipeline_saved_normally() {
+        let startup = vec![(
+            "monitor-2".into(),
+            AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                "startup",
+                serde_json::json!({}),
+            ),
+        )];
+        let outcome = SessionOutcome {
+            events: vec![Event::Saved {
+                ts: Timestamp::now(),
+                session: "test".into(),
+                target: "lost.mp4".into(),
+                file: "lost.mp4".into(),
+                stop_reason: StopReason::TargetLost,
+                duration_ms: 1,
+                frames: 1,
+                size_bytes: 1,
+            }],
+            exit_code: 3,
+            error: Some(AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                "runtime",
+                serde_json::json!({"target": "lost.mp4"}),
+            )),
+        };
+        assert!(aggregate_startup_failures(&startup, &outcome).is_none());
+    }
+
+    #[test]
+    fn partial_failure_merges_startup_and_runtime_failures() {
+        let startup = vec![(
+            "monitor-2".into(),
+            AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                "startup",
+                serde_json::json!({}),
+            ),
+        )];
+        let outcome = SessionOutcome {
+            events: vec![Event::Saved {
+                ts: Timestamp::now(),
+                session: "test".into(),
+                target: "good.mp4".into(),
+                file: "good.mp4".into(),
+                stop_reason: StopReason::DurationLimit,
+                duration_ms: 1,
+                frames: 1,
+                size_bytes: 1,
+            }],
+            exit_code: 6,
+            error: Some(AirecError::new(
+                ErrorCode::PartialFailure,
+                "runtime",
+                serde_json::json!({"failures": [{"target": "monitor-3", "code": "CAPTURE_INIT_FAILED"}]}),
+            )),
+        };
+        let aggregate = aggregate_startup_failures(&startup, &outcome).unwrap();
+        assert_eq!(aggregate.code, ErrorCode::PartialFailure);
+        assert_eq!(aggregate.data["successes"].as_array().unwrap().len(), 1);
+        assert_eq!(aggregate.data["failures"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn input_events_are_normalized_to_the_first_video_frame() {
+        let event = InputEvent::Click {
+            t_ms: 350,
+            button: airec_core::MouseButton::Left,
+            x: 10,
+            y: 20,
+            double: false,
+        };
+        assert!(matches!(
+            normalize_input_event(event, 250),
+            Some(InputEvent::Click { t_ms: 100, .. })
+        ));
+        assert!(
+            normalize_input_event(
+                InputEvent::Move {
+                    t_ms: 249,
+                    x: 0,
+                    y: 0
+                },
+                250
+            )
+            .is_none()
         );
     }
 }

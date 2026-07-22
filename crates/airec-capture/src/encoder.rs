@@ -37,6 +37,7 @@ impl EncoderFactory for WindowsEncoderFactory {
                 encoder: Some(encoder),
                 config,
                 hardware: true,
+                frames_written: 0,
             })),
             Err(hardware_error) => {
                 eprintln!(
@@ -56,6 +57,7 @@ impl EncoderFactory for WindowsEncoderFactory {
                     encoder: Some(encoder),
                     config,
                     hardware: false,
+                    frames_written: 0,
                 }))
             }
         }
@@ -96,42 +98,62 @@ struct MfEncoder {
     encoder: Option<VideoEncoder>,
     config: EncoderConfig,
     hardware: bool,
+    frames_written: u64,
 }
 
 impl PipelineEncoder for MfEncoder {
     fn write_frame(&mut self, frame: &CaptureFrame) -> Result<(), AirecError> {
-        let packed = packed_bottom_up(frame, self.config.width, self.config.height);
+        let width = even(frame.width);
+        let height = even(frame.height);
+        let packed = packed_bottom_up(frame, width, height);
         let timestamp_hns = i64::try_from(frame.t_ms.saturating_mul(10_000)).unwrap_or(i64::MAX);
-        let result = self
+        let first_result = self
             .encoder
             .as_mut()
             .expect("encoder exists until finish")
-            .send_frame_buffer(&packed, timestamp_hns);
-        if let Err(hardware_error) = result {
-            if !self.hardware {
-                return Err(encoder_error(hardware_error));
+            .send_frame_buffer(&packed, timestamp_hns)
+            .and_then(|()| {
+                if self.frames_written == 0 {
+                    self.encoder
+                        .as_mut()
+                        .expect("encoder exists until finish")
+                        .wait_until_ready(std::time::Duration::from_millis(500))?;
+                }
+                Ok(())
+            });
+        match first_result {
+            Ok(()) => {
+                self.frames_written += 1;
+                Ok(())
             }
-            self.encoder.take();
-            eprintln!(
-                "warning: hardware H.264 encoder failed on the first sample ({hardware_error}); falling back to software"
-            );
-            let mut software = create_encoder(&self.config, false).map_err(|software_error| {
-                AirecError::new(
-                    ErrorCode::EncoderUnavailable,
-                    "hardware encoder failed and software fallback could not start",
-                    serde_json::json!({
-                        "hardware": hardware_error.to_string(),
-                        "software": software_error.to_string(),
-                    }),
-                )
-            })?;
-            software
-                .send_frame_buffer(&packed, timestamp_hns)
-                .map_err(encoder_error)?;
-            self.encoder = Some(software);
-            self.hardware = false;
+            Err(hardware_error) if self.hardware && self.frames_written == 0 => {
+                self.encoder.take();
+                let _ = std::fs::remove_file(&self.config.path);
+                eprintln!(
+                    "warning: hardware H.264 encoder unavailable ({hardware_error}); falling back to software"
+                );
+                let mut software =
+                    create_encoder(&self.config, false).map_err(|software_error| {
+                        encoder_unavailable(&hardware_error, &software_error)
+                    })?;
+                software
+                    .send_frame_buffer(&packed, timestamp_hns)
+                    .and_then(|()| software.wait_until_ready(std::time::Duration::from_secs(1)))
+                    .map_err(|software_error| {
+                        encoder_unavailable(&hardware_error, &software_error)
+                    })?;
+                self.encoder = Some(software);
+                self.hardware = false;
+                self.frames_written = 1;
+                Ok(())
+            }
+            Err(error) if !self.hardware && self.frames_written == 0 => Err(AirecError::new(
+                ErrorCode::EncoderUnavailable,
+                "software H.264 encoder failed to start",
+                serde_json::json!({"software": error.to_string()}),
+            )),
+            Err(error) => Err(encoder_error(error)),
         }
-        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), AirecError> {
@@ -141,6 +163,20 @@ impl PipelineEncoder for MfEncoder {
             .finish()
             .map_err(encoder_error)
     }
+}
+
+fn encoder_unavailable(
+    hardware: &windows_capture::encoder::VideoEncoderError,
+    software: &windows_capture::encoder::VideoEncoderError,
+) -> AirecError {
+    AirecError::new(
+        ErrorCode::EncoderUnavailable,
+        "hardware and software H.264 encoders are unavailable",
+        serde_json::json!({
+            "hardware": hardware.to_string(),
+            "software": software.to_string(),
+        }),
+    )
 }
 
 fn packed_bottom_up(frame: &CaptureFrame, width: u32, height: u32) -> Vec<u8> {

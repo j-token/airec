@@ -17,6 +17,7 @@ fn pipe_name(session: &str) -> Result<interprocess::local_socket::Name<'static>,
 pub fn serve(
     session: String,
     handler: impl Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
+    response_written: impl Fn(&ControlResponse) + Send + Sync + 'static,
 ) -> Result<(), AirecError> {
     let listener = ListenerOptions::new()
         .name(pipe_name(&session)?)
@@ -42,9 +43,11 @@ pub fn serve(
                 message: error.to_string(),
             },
         };
-        if serde_json::to_writer(connection.get_mut(), &response).is_ok() {
-            let _ = connection.get_mut().write_all(b"\n");
-            let _ = connection.get_mut().flush();
+        if serde_json::to_writer(connection.get_mut(), &response).is_ok()
+            && connection.get_mut().write_all(b"\n").is_ok()
+            && connection.get_mut().flush().is_ok()
+        {
+            response_written(&response);
         }
     }
     Ok(())
@@ -86,10 +89,48 @@ fn ipc_error(message: String) -> AirecError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
     fn display_name_matches_prd() {
         assert_eq!(pipe_display_name("a1b2"), r"\\.\pipe\airec-a1b2");
+    }
+
+    #[test]
+    fn response_written_callback_follows_a_readable_response() {
+        let session = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let written = Arc::new(AtomicBool::new(false));
+        let server_written = written.clone();
+        let server_session = session.clone();
+        std::thread::spawn(move || {
+            serve(
+                server_session,
+                |_| ControlResponse::Events {
+                    events: Vec::new(),
+                    exit_code: 0,
+                },
+                move |_| server_written.store(true, Ordering::Release),
+            )
+            .expect("test named-pipe server");
+        });
+
+        let response = (0..100)
+            .find_map(|_| {
+                let response = request(&session, &ControlRequest::Stop).ok();
+                if response.is_none() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                response
+            })
+            .expect("server became reachable");
+        assert!(matches!(
+            response,
+            ControlResponse::Events { exit_code: 0, .. }
+        ));
+        assert!(written.load(Ordering::Acquire));
     }
 }

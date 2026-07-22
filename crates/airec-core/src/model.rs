@@ -133,6 +133,10 @@ pub trait FrameSource: Send {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<CaptureFrame>, AirecError>;
     fn is_target_alive(&self) -> bool;
     fn is_minimized(&self) -> bool;
+    /// Frames discarded by the capture transport before the session could consume them.
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 pub trait TargetCatalog: Send + Sync {

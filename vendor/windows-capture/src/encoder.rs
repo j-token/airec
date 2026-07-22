@@ -1,9 +1,9 @@
 use std::fs::{self, File};
 use std::path::Path;
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, AtomicU64};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use windows::Foundation::{TimeSpan, TypedEventHandler};
@@ -214,6 +214,9 @@ pub enum VideoEncoderError {
     /// See [`crate::settings::ColorFormat`].
     #[error("Unsupported frame color format: {0:?}")]
     UnsupportedFrameFormat(ColorFormat),
+    /// The transcoder neither requested a video sample nor reported an error in time.
+    #[error("Encoder did not become ready before the startup timeout")]
+    EncoderStartupTimeout,
 }
 
 unsafe impl Send for VideoEncoderError {}
@@ -697,6 +700,7 @@ pub struct VideoEncoder {
     // Transcode worker
     transcode_thread: Option<JoinHandle<Result<(), VideoEncoderError>>>,
     error_notify: Arc<AtomicBool>,
+    video_requests: Arc<AtomicU64>,
 
     // Feature toggles
     is_video_disabled: bool,
@@ -769,6 +773,7 @@ impl VideoEncoder {
         audio_receiver: AudioFrameReceiver,
         audio_block_align: u32,
         audio_sample_rate: u32,
+        video_requests: Arc<AtomicU64>,
     ) -> Result<i64, VideoEncoderError> {
         let token = media_stream_source.SampleRequested(&TypedEventHandler::<
             MediaStreamSource,
@@ -780,6 +785,11 @@ impl VideoEncoder {
 
             let request = sample_requested.Request()?;
             let is_audio = request.StreamDescriptor()?.cast::<AudioStreamDescriptor>().is_ok();
+            if !is_video_disabled && (is_audio_disabled || !is_audio) {
+                // The second request proves that the first submitted video sample
+                // passed through the asynchronous transcoder successfully.
+                video_requests.fetch_add(1, atomic::Ordering::AcqRel);
+            }
 
             // Always offload blocking work to the thread pool; never block the MSS event
             // thread.
@@ -931,6 +941,7 @@ impl VideoEncoder {
         let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
         let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
 
+        let video_requests = Arc::new(AtomicU64::new(0));
         let sample_requested = Self::attach_sample_requested_handlers(
             &media_stream_source,
             is_video_disabled,
@@ -939,6 +950,7 @@ impl VideoEncoder {
             audio_receiver,
             audio_block_align,
             audio_sr,
+            video_requests.clone(),
         )?;
 
         let media_transcoder = MediaTranscoder::new()?;
@@ -964,11 +976,11 @@ impl VideoEncoder {
         let transcode_thread = thread::spawn({
             let error_notify = error_notify.clone();
             move || -> Result<(), VideoEncoderError> {
-                let result = transcode.TranscodeAsync();
+                let result = transcode.TranscodeAsync().and_then(|operation| operation.join());
                 if result.is_err() {
-                    error_notify.store(true, atomic::Ordering::Relaxed);
+                    error_notify.store(true, atomic::Ordering::Release);
                 }
-                result?.join()?;
+                result?;
                 drop(media_transcoder);
                 Ok(())
             }
@@ -983,6 +995,7 @@ impl VideoEncoder {
             starting,
             transcode_thread: Some(transcode_thread),
             error_notify,
+            video_requests,
             is_video_disabled,
             is_audio_disabled,
             audio_sample_rate: audio_sr,
@@ -1085,6 +1098,7 @@ impl VideoEncoder {
         let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
         let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
 
+        let video_requests = Arc::new(AtomicU64::new(0));
         let sample_requested = Self::attach_sample_requested_handlers(
             &media_stream_source,
             is_video_disabled,
@@ -1093,6 +1107,7 @@ impl VideoEncoder {
             audio_receiver,
             audio_block_align,
             audio_sr,
+            video_requests.clone(),
         )?;
 
         let media_transcoder = MediaTranscoder::new()?;
@@ -1106,11 +1121,11 @@ impl VideoEncoder {
         let transcode_thread = thread::spawn({
             let error_notify = error_notify.clone();
             move || -> Result<(), VideoEncoderError> {
-                let result = transcode.TranscodeAsync();
+                let result = transcode.TranscodeAsync().and_then(|operation| operation.join());
                 if result.is_err() {
-                    error_notify.store(true, atomic::Ordering::Relaxed);
+                    error_notify.store(true, atomic::Ordering::Release);
                 }
-                result?.join()?;
+                result?;
                 drop(media_transcoder);
                 Ok(())
             }
@@ -1125,6 +1140,7 @@ impl VideoEncoder {
             starting,
             transcode_thread: Some(transcode_thread),
             error_notify,
+            video_requests,
             is_video_disabled,
             is_audio_disabled,
             audio_sample_rate: audio_sr,
@@ -1210,7 +1226,7 @@ impl VideoEncoder {
 
         self.frame_sender.send(Some((VideoEncoderSource::DirectX(surface), timestamp)))?;
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
+        if self.error_notify.load(atomic::Ordering::Acquire)
             && let Some(t) = self.transcode_thread.take()
         {
             t.join().expect("Failed to join transcode thread")?;
@@ -1258,7 +1274,7 @@ impl VideoEncoder {
         // Advance counter after stamping
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
+        if self.error_notify.load(atomic::Ordering::Acquire)
             && let Some(t) = self.transcode_thread.take()
         {
             t.join().expect("Failed to join transcode thread")?;
@@ -1286,13 +1302,33 @@ impl VideoEncoder {
 
         self.frame_sender.send(Some((VideoEncoderSource::Buffer(buffer.to_vec()), timestamp)))?;
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
+        if self.error_notify.load(atomic::Ordering::Acquire)
             && let Some(t) = self.transcode_thread.take()
         {
             t.join().expect("Failed to join transcode thread")?;
         }
 
         Ok(())
+    }
+
+    /// Waits until Media Foundation requests its first video sample, proving that
+    /// asynchronous encoder startup succeeded, or returns the startup error.
+    pub fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), VideoEncoderError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.video_requests.load(atomic::Ordering::Acquire) >= 2 {
+                return Ok(());
+            }
+            if self.error_notify.load(atomic::Ordering::Acquire)
+                && let Some(thread) = self.transcode_thread.take()
+            {
+                return thread.join().expect("Failed to join transcode thread");
+            }
+            if Instant::now() >= deadline {
+                return Err(VideoEncoderError::EncoderStartupTimeout);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Sends an audio buffer (owned inside). Returns immediately.
@@ -1315,7 +1351,7 @@ impl VideoEncoder {
 
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
+        if self.error_notify.load(atomic::Ordering::Acquire)
             && let Some(t) = self.transcode_thread.take()
         {
             t.join().expect("Failed to join transcode thread")?;

@@ -5,6 +5,8 @@ mod encoder;
 pub use encoder::WindowsEncoderFactory;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use airec_core::{
@@ -204,15 +206,31 @@ impl TargetCatalog for WindowsCaptureBackend {
                 }
             }
         }
-        if resolved.len() > 1 && !output_is_directory {
-            return Err(AirecError::new(
-                ErrorCode::OutputIoError,
-                "--out-dir is required for multiple targets",
-                serde_json::json!({"targets": resolved.len()}),
-            ));
+        if !output_is_directory {
+            apply_output_template(&mut resolved, output)?;
         }
         Ok(resolved)
     }
+}
+
+fn apply_output_template(
+    targets: &mut [ResolvedTarget],
+    template: &Path,
+) -> Result<(), AirecError> {
+    let template = template.to_string_lossy();
+    if targets.len() > 1 && !template.contains("{target}") {
+        return Err(AirecError::new(
+            ErrorCode::OutputIoError,
+            "multi-target --out must contain the {target} placeholder or use --out-dir",
+            serde_json::json!({"targets": targets.len(), "template": template}),
+        ));
+    }
+    if template.contains("{target}") {
+        for target in targets {
+            target.output = PathBuf::from(template.replace("{target}", &target.id));
+        }
+    }
+    Ok(())
 }
 
 trait Pipe: Sized {
@@ -271,11 +289,13 @@ enum CaptureMessage {
 struct CaptureFlags {
     sender: Sender<CaptureMessage>,
     started_at: std::time::Instant,
+    dropped: Arc<AtomicU64>,
 }
 
 struct Handler {
     sender: Sender<CaptureMessage>,
     started_at: std::time::Instant,
+    dropped: Arc<AtomicU64>,
 }
 
 type HandlerError = Box<dyn std::error::Error + Send + Sync>;
@@ -288,6 +308,7 @@ impl GraphicsCaptureApiHandler for Handler {
         Ok(Self {
             sender: context.flags.sender,
             started_at: context.flags.started_at,
+            dropped: context.flags.dropped,
         })
     }
 
@@ -307,7 +328,9 @@ impl GraphicsCaptureApiHandler for Handler {
             bgra: buffer.as_raw_buffer().to_vec(),
             t_ms: self.started_at.elapsed().as_millis() as u64,
         });
-        let _ = self.sender.try_send(message);
+        if let Err(crossbeam_channel::TrySendError::Full(_)) = self.sender.try_send(message) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -322,6 +345,7 @@ struct WgcFrameSource {
     control: Option<CaptureControl<Handler, HandlerError>>,
     alive: bool,
     hwnd: Option<isize>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl Drop for WgcFrameSource {
@@ -369,6 +393,10 @@ impl FrameSource for WgcFrameSource {
             .as_bool()
         })
     }
+
+    fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl CaptureBackend for WindowsCaptureBackend {
@@ -378,9 +406,11 @@ impl CaptureBackend for WindowsCaptureBackend {
         options: &RecordingOptions,
     ) -> Result<Box<dyn FrameSource>, AirecError> {
         let (sender, receiver) = crossbeam_channel::bounded(3);
+        let dropped = Arc::new(AtomicU64::new(0));
         let flags = CaptureFlags {
             sender,
             started_at: options.started_at,
+            dropped: dropped.clone(),
         };
         let cursor = if options.cursor {
             CursorCaptureSettings::WithCursor
@@ -449,6 +479,7 @@ impl CaptureBackend for WindowsCaptureBackend {
             control: Some(control),
             alive: true,
             hwnd: target.hwnd,
+            dropped,
         }))
     }
 }
@@ -537,5 +568,42 @@ mod tests {
             target.output,
             Path::new("rec").join("my-app-settings-1a2b.mp4")
         );
+    }
+
+    #[test]
+    fn multi_target_out_expands_target_placeholder() {
+        let monitor = |index| MonitorInfo {
+            index,
+            name: format!("Display {index}"),
+            width: 1920,
+            height: 1080,
+            primary: index == 1,
+            scale: 1.0,
+        };
+        let mut targets = vec![
+            resolve_monitor(&monitor(1), Path::new("unused"), false),
+            resolve_monitor(&monitor(2), Path::new("unused"), false),
+        ];
+        apply_output_template(&mut targets, Path::new("evidence-{target}.mp4")).unwrap();
+        assert_eq!(targets[0].output, Path::new("evidence-monitor-1.mp4"));
+        assert_eq!(targets[1].output, Path::new("evidence-monitor-2.mp4"));
+    }
+
+    #[test]
+    fn multi_target_out_without_placeholder_is_rejected() {
+        let monitor = MonitorInfo {
+            index: 1,
+            name: "Display".into(),
+            width: 1920,
+            height: 1080,
+            primary: true,
+            scale: 1.0,
+        };
+        let mut targets = vec![
+            resolve_monitor(&monitor, Path::new("one.mp4"), false),
+            resolve_monitor(&monitor, Path::new("one.mp4"), false),
+        ];
+        let error = apply_output_template(&mut targets, Path::new("one.mp4")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutputIoError);
     }
 }
