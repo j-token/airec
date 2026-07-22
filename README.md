@@ -5,4 +5,3 @@
 > Recordings can contain passwords, tokens, personal data, and other sensitive information. Review every recording before sharing it. UAC secure-desktop and DRM-protected content are intentionally not bypassed and may appear black.
 
 The v0.1 application has no GUI, audio capture, network access, upload feature, keyboard hook, or always-on daemon.
-
