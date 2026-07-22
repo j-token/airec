@@ -23,7 +23,7 @@ GUI, 오디오 녹음, 네트워크 접근, 업로드 기능, 키보드 후킹, 
 Windows 10 버전 2004 이상 또는 Windows 11, x86_64에서 동작합니다.
 
 ```powershell
-irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 ```
 
 최신 릴리즈를 받아 SHA256을 확인하고, `airec.exe`를 `%LOCALAPPDATA%\airec\bin`에 두고 그 경로를 사용자 PATH에 추가합니다. 관리자 권한도 Rust 툴체인도 필요 없고 빌드도 하지 않습니다. 끝나면 새 터미널을 열어야 PATH가 반영됩니다.
@@ -31,7 +31,7 @@ irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.p
 버전을 고정하거나, 다른 경로에 설치하거나, 지우려면 인자를 받을 수 있게 스크립트블록으로 실행합니다.
 
 ```powershell
-$s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1))
+$s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1))
 & $s -Version v0.2.2
 & $s -InstallDir D:\tools\airec
 & $s -Uninstall
@@ -39,7 +39,7 @@ $s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/screen
 
 삭제는 실행 파일과 PATH 항목만 지웁니다. 녹화본과 `airec.toml`은 그대로 둡니다.
 
-스크립트를 셸에 바로 흘려 넣는 게 꺼려지면 [릴리즈 페이지](https://github.com/j-token/screen-recorder-cli/releases)에서 zip을 받아 옆에 있는 `.sha256`으로 검증한 뒤 `airec.exe`를 PATH 아무 곳에나 두면 됩니다.
+스크립트를 셸에 바로 흘려 넣는 게 꺼려지면 [릴리즈 페이지](https://github.com/j-token/airec/releases)에서 zip을 받아 옆에 있는 `.sha256`으로 검증한 뒤 `airec.exe`를 PATH 아무 곳에나 두면 됩니다.
 
 소스에서 빌드하려면 Rust 1.85 이상이 필요합니다.
 
@@ -138,8 +138,8 @@ airec record --monitor all --on-failure abort      # 전체를 finalize하고 �
 이 내용은 `skills/airec`에 에이전트 스킬로 정리돼 있습니다. 설치하면 에이전트가 명령어와 `stop_reason` 판정 규칙을 아는 상태로 시작합니다.
 
 ```powershell
-irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
-npx skills add j-token/screen-recorder-cli --skill airec
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+npx skills add j-token/airec --skill airec
 ```
 
 스킬은 사용법 문서지 녹화기 자체가 아닙니다. 첫 줄을 빼면 에이전트가 없는 명령어를 호출하게 되니 CLI도 같이 깔아야 합니다. 둘째 줄에 `-g`를 붙이면 현재 프로젝트가 아니라 전체 프로젝트에 설치됩니다. `--skill airec`을 빼면 이 저장소의 내부 워크플로 스킬까지 함께 목록에 잡히는데, 그건 녹화기와 무관합니다.

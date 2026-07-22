@@ -12,7 +12,7 @@ Use `airec` only for explicit evidence tasks. It records pixels and mouse activi
 This skill is instructions only; `airec.exe` is a separate download. If `airec --version` fails, install it before doing anything else:
 
 ```powershell
-irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 ```
 
 The script verifies the release checksum, installs to `%LOCALAPPDATA%\airec\bin`, and adds that directory to the user PATH. It needs no administrator rights and no Rust toolchain. PATH changes do not reach an already-running shell, so in the current session invoke the executable by its full path, `$env:LOCALAPPDATA\airec\bin\airec.exe`, until a new shell is started.

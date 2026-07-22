@@ -4,15 +4,15 @@
 
 .DESCRIPTION
     Downloads a prebuilt airec.exe from the GitHub releases of
-    j-token/screen-recorder-cli, verifies its SHA256, places it in a per-user
+    j-token/airec, verifies its SHA256, places it in a per-user
     directory, and puts that directory on the user PATH. No admin rights and no
     Rust toolchain are needed.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1))) -Version v0.2.2
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1))) -Version v0.2.2
 #>
 [CmdletBinding()]
 param(
@@ -30,7 +30,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repo = "j-token/screen-recorder-cli"
+$Repo = "j-token/airec"
 $Target = "x86_64-pc-windows-msvc"
 $ExePath = Join-Path $InstallDir "airec.exe"
 

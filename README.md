@@ -23,7 +23,7 @@ It has no GUI, no audio capture, no network access, no upload feature, no keyboa
 Windows 10 version 2004 or later, or Windows 11, on x86_64.
 
 ```powershell
-irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 ```
 
 That takes the latest release, checks its SHA256, drops `airec.exe` in `%LOCALAPPDATA%\airec\bin`, and puts that directory on your user PATH. No admin rights, no Rust toolchain, nothing to compile. Open a new terminal afterwards so the PATH change applies.
@@ -31,7 +31,7 @@ That takes the latest release, checks its SHA256, drops `airec.exe` in `%LOCALAP
 To pin a version, install elsewhere, or remove it, run the script as a scriptblock so it can take arguments:
 
 ```powershell
-$s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1))
+$s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1))
 & $s -Version v0.2.2
 & $s -InstallDir D:\tools\airec
 & $s -Uninstall
@@ -39,7 +39,7 @@ $s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/screen
 
 Uninstalling removes the executable and the PATH entry, and leaves your recordings and `airec.toml` alone.
 
-If piping a script into your shell is not something you want to do, take the zip from the [releases page](https://github.com/j-token/screen-recorder-cli/releases), verify it against the `.sha256` next to it, and put `airec.exe` anywhere on your PATH.
+If piping a script into your shell is not something you want to do, take the zip from the [releases page](https://github.com/j-token/airec/releases), verify it against the `.sha256` next to it, and put `airec.exe` anywhere on your PATH.
 
 Building from source needs Rust 1.85 or later:
 
@@ -138,8 +138,8 @@ Errors are structured, and the exit code matches the code:
 All of this is packaged as an agent skill under `skills/airec`, so the agent starts out knowing the commands and the `stop_reason` rule:
 
 ```powershell
-irm https://raw.githubusercontent.com/j-token/screen-recorder-cli/main/install.ps1 | iex
-npx skills add j-token/screen-recorder-cli --skill airec
+irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+npx skills add j-token/airec --skill airec
 ```
 
 The skill is instructions, not the recorder, so the first line is not optional: install the CLI too or the agent will call a command that does not exist. Add `-g` to the second line to install the skill for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.

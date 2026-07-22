@@ -107,9 +107,9 @@ The near-static evidence case clears both the required 90% and stretch 95% reduc
 
 The skill package moved from `skill/` to `skills/airec/`, superseding the location chosen in D-020. The Skills CLI (`npx skills`) discovers skills by walking a fixed set of container directories one level deep; `skills/` is on that list and `skill/` is not, so the previous layout was only reachable through the CLI's fallback recursive search. The CLI also requires the frontmatter `name` to match the parent directory name, which `skill/` violated while declaring `name: airec`.
 
-The directory name is therefore the installed skill name, and `npx skills add j-token/screen-recorder-cli --skill airec` is the supported install path. No manifest file is involved; the Skills CLI has no publish or registry step and resolves everything from the git repository layout.
+The directory name is therefore the installed skill name, and `npx skills add j-token/airec --skill airec` is the supported install path. No manifest file is involved; the Skills CLI has no publish or registry step and resolves everything from the git repository layout.
 
-The repository's own agent skills under `.agents/skills` remain where they are. Those paths are also CLI discovery locations, so a bare `npx skills add j-token/screen-recorder-cli` lists them alongside `airec`; installing the recorder skill alone requires the `--skill airec` filter.
+The repository's own agent skills under `.agents/skills` remain where they are. Those paths are also CLI discovery locations, so a bare `npx skills add j-token/airec` lists them alongside `airec`; installing the recorder skill alone requires the `--skill airec` filter.
 
 ## D-023 — Prebuilt release distribution and install script
 
