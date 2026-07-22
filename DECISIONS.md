@@ -83,3 +83,22 @@ Window client clipping and extended-frame mapping are refreshed while recording 
 ## D-020 — Claude Code skill artifact
 
 The requested distributable artifact root is `skill/`, with `skill/SKILL.md` carrying valid skill frontmatter. Installers copy that directory as the `airec` skill into the Claude Code user or project skill location; the repository does not duplicate it under `.claude`, avoiding two independently drifting instructions. Automated validation checks the package structure; discovery and triggering remain a manual Claude Code integration check.
+
+## D-021 — Fidelity-preserving GIF frame differencing
+
+GIF conversion keeps the requested sampling rate and output dimensions, but no longer emits every sampled frame as a full opaque image. The first image and changed colors use deterministic 5-bit histogram median-cut palettes with up to 255 opaque colors. Later images reserve index zero for transparency, use disposal method 1 (`do not dispose`), crop to the union rectangle of pixels that improve the composited image's squared RGB error, and preserve all other pixels from the previous canvas. Identical sampled frames are represented by extending the pending image delay. Delays remain derived from the source timeline, so descriptor collapse does not drop elapsed time or change playback speed.
+
+The GIF retains the legacy 3-3-2 palette as its global table. This gives high-change frames a compatibility and size fallback: the encoder compares actual LZW sizes and may write a full fixed-palette image when it is smaller than the adaptive difference. That fallback exactly matches the old quantization error. Adaptive updates are accepted only when the resulting full-canvas MSE is no worse than the old 3-3-2 result. A trial 63-color first-frame limit was rejected after visible color shifts despite a favorable aggregate MSE; the default uses 255 colors and does not dither because dithering adds flat-region noise and harms LZW compression.
+
+The deterministic 31-frame, 960×540, 10 FPS report benchmark runs with:
+
+`cargo test --release -p airec-capture report_default_dimension_gif_benchmark -- --ignored --nocapture`
+
+| Scenario | Legacy bytes | Adaptive full-frame bytes | Optimized bytes | Reduction | Legacy RGB MSE | Optimized RGB MSE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Near-static window and moving cursor | 2,515,275 | 2,749,165 | 119,604 | 95.24% | 477.2956 | 37.6046 |
+| Localized text change | 2,525,175 | 2,756,784 | 105,355 | 95.83% | 477.4084 | 37.5129 |
+| Large-area scroll | 204,321 | 461,983 | 212,771 | -4.14% | 547.7675 | 530.1520 |
+| Full-frame change | 21,185,736 | 21,413,782 | 21,192,892 | -0.03% | 424.4797 | 416.0086 |
+
+The near-static evidence case clears both the required 90% and stretch 95% reductions. Localized change also clears both. Scroll and full-frame change deliberately do not trade fidelity for the size target; the fixed-palette fallback limits their growth while retaining slightly lower error. Tests independently parse LZW data, local palettes, transparency, and the composited canvas. A release conversion was also decoded as an 11-frame 960×544 GIF by Windows WIC and rendered by Chrome headless. GIF89a, Netscape looping, temporary-output commit, overwrite refusal, error mapping, dimensions, sampling rate, and existing `converted` JSONL fields remain unchanged.
