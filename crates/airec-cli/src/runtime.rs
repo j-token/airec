@@ -1,7 +1,7 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,6 +67,8 @@ pub fn execute(cli: Cli) -> Result<i32, (AirecError, bool)> {
         Command::Stop(args) => stop(args),
         Command::Doctor(args) => doctor(args),
         Command::Session(args) => session_child(&args.config).map_err(|error| (error, false)),
+        #[cfg(debug_assertions)]
+        Command::TestHold(args) => test_hold(args).map_err(|error| (error, false)),
     }
 }
 
@@ -145,6 +147,11 @@ fn record(args: RecordArgs) -> Result<i32, (AirecError, bool)> {
 }
 
 fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
+    #[cfg(debug_assertions)]
+    if let Some(ready) = std::env::var_os("AIREC_TEST_DETACHED_PIPE_PROBE") {
+        return start_detached_pipe_probe(PathBuf::from(ready), args.json);
+    }
+
     let (targets, options) =
         prepare(&args.targets, &args.recording).map_err(|error| (error, args.json))?;
     let session = short_session_id();
@@ -1233,7 +1240,6 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, AirecE
 }
 
 fn spawn_detached(config: &Path) -> Result<(), AirecError> {
-    use std::os::windows::process::CommandExt;
     let executable = std::env::current_exe().map_err(|error| {
         AirecError::new(
             ErrorCode::OutputIoError,
@@ -1241,23 +1247,149 @@ fn spawn_detached(config: &Path) -> Result<(), AirecError> {
             serde_json::json!({"component": "current_exe"}),
         )
     })?;
-    ProcessCommand::new(executable)
-        .arg("_session")
-        .arg("--config")
-        .arg(config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000)
-        .spawn()
-        .map(|_| ())
+    spawn_detached_process(
+        &executable,
+        &[
+            OsStr::new("_session"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+        ],
+    )
+}
+
+fn spawn_detached_process(executable: &Path, arguments: &[&OsStr]) -> Result<(), AirecError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let mut executable_wide: Vec<u16> = executable.as_os_str().encode_wide().collect();
+    executable_wide.push(0);
+    let mut command_line = Vec::new();
+    push_windows_argument(&mut command_line, executable.as_os_str());
+    for argument in arguments {
+        command_line.push(u16::from(b' '));
+        push_windows_argument(&mut command_line, argument);
+    }
+    command_line.push(0);
+
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
+            .expect("STARTUPINFOW size fits in u32"),
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(executable_wide.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut process,
+        )
         .map_err(|error| {
             AirecError::new(
                 ErrorCode::CaptureInitFailed,
                 error.to_string(),
                 serde_json::json!({"component": "detach"}),
             )
-        })
+        })?;
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+fn push_windows_argument(command_line: &mut Vec<u16>, argument: &OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+
+    command_line.push(u16::from(b'"'));
+    let mut backslashes = 0_usize;
+    for unit in argument.encode_wide() {
+        if unit == u16::from(b'\\') {
+            backslashes += 1;
+        } else if unit == u16::from(b'"') {
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+            command_line.push(unit);
+            backslashes = 0;
+        } else {
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+            command_line.push(unit);
+            backslashes = 0;
+        }
+    }
+    command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    command_line.push(u16::from(b'"'));
+}
+
+#[cfg(debug_assertions)]
+fn start_detached_pipe_probe(ready: PathBuf, json: bool) -> Result<i32, (AirecError, bool)> {
+    let executable = std::env::current_exe().map_err(|error| {
+        (
+            AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                error.to_string(),
+                serde_json::json!({"component": "current_exe"}),
+            ),
+            json,
+        )
+    })?;
+    let hold_ms = std::ffi::OsString::from("5000");
+    spawn_detached_process(
+        &executable,
+        &[
+            OsStr::new("_test_hold"),
+            OsStr::new("--ready"),
+            ready.as_os_str(),
+            OsStr::new("--hold-ms"),
+            hold_ms.as_os_str(),
+        ],
+    )
+    .map_err(|error| (error, json))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ready.exists() {
+        if Instant::now() >= deadline {
+            return Err((
+                AirecError::new(
+                    ErrorCode::CaptureInitFailed,
+                    "detached pipe probe did not start",
+                    serde_json::json!({"component": "detach_test"}),
+                ),
+                json,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let event = Event::Started {
+        ts: Timestamp::now(),
+        session: "pipe-probe".into(),
+        target: None,
+        targets: Vec::new(),
+    };
+    print_event(&event, json);
+    Ok(0)
+}
+
+#[cfg(debug_assertions)]
+fn test_hold(args: crate::args::TestHoldArgs) -> Result<i32, AirecError> {
+    std::fs::write(&args.ready, b"ready").map_err(|error| {
+        AirecError::new(
+            ErrorCode::OutputIoError,
+            error.to_string(),
+            serde_json::json!({"path": args.ready}),
+        )
+    })?;
+    std::thread::sleep(Duration::from_millis(args.hold_ms));
+    Ok(0)
 }
 
 fn install_diagnostic_stderr(session: &str) -> Result<File, AirecError> {

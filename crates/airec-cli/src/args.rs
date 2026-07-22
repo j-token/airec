@@ -29,6 +29,9 @@ pub enum Command {
     Doctor(JsonArgs),
     #[command(name = "_session", hide = true)]
     Session(SessionArgs),
+    #[cfg(debug_assertions)]
+    #[command(name = "_test_hold", hide = true)]
+    TestHold(TestHoldArgs),
 }
 
 #[derive(Debug, Args)]
@@ -140,6 +143,15 @@ pub struct StopArgs {
 pub struct SessionArgs {
     #[arg(long)]
     pub config: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Args)]
+pub struct TestHoldArgs {
+    #[arg(long)]
+    pub ready: PathBuf,
+    #[arg(long)]
+    pub hold_ms: u64,
 }
 
 fn parse_hwnd(value: &str) -> Result<isize, String> {
