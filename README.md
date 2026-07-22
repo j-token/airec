@@ -144,6 +144,8 @@ npx skills add j-token/airec --skill airec
 
 The skill is instructions, not the recorder, so the first line is not optional: install the CLI too or the agent will call a command that does not exist. Add `-g` to the second line to install the skill for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
 
+> Do not run `npx skills add` inside a clone of this repository. The Skills CLI writes the skill to `.agents/skills/<name>` and points the discovery directories at it with symlinks. When a real `skills/<name>` directory is already there it replaces that directory with the symlink, and the files that were in it are gone with no warning and no backup. In this repository `skills/airec` is the skill's source, so installing here destroys it. Elsewhere this only matters if you keep a skill of your own under the same name.
+
 ## Pointer effects
 
 Clicks, drags, and pointer movement are drawn into the frames before encoding, so they survive in any player and need no post-processing. Left and right clicks get different colors, and a drag shows the path from where it started.
