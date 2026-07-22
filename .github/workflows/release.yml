@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.2.2)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $version = $tag -replace '^v', ''
+          $manifest = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($version -ne $manifest) {
+            throw "tag $tag does not match workspace version $manifest"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ env.TARGET }} --bin airec
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "target\${{ env.TARGET }}\release\airec.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "airec --version failed" }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $name = "airec-v${{ steps.version.outputs.version }}-${{ env.TARGET }}"
+          New-Item -ItemType Directory -Path dist\$name | Out-Null
+          Copy-Item "target\${{ env.TARGET }}\release\airec.exe" dist\$name\
+          Copy-Item LICENSE, NOTICE, README.md dist\$name\
+          Compress-Archive -Path dist\$name\* -DestinationPath "dist\$name.zip"
+          $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content "dist\$name.zip.sha256" -NoNewline
+          "asset=dist/$name.zip" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $fence = [string][char]0x60 * 3
+          $notes = @(
+            "Windows x86_64 build of airec $tag.",
+            "",
+            "Install:",
+            "",
+            ($fence + "powershell"),
+            "irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex",
+            $fence,
+            "",
+            "SHA256 of the zip: ${{ steps.package.outputs.sha256 }}"
+          )
+          $notes -join "`n" | Set-Content dist\notes.md -Encoding utf8
+          gh release create $tag --title $tag --notes-file dist\notes.md ${{ steps.package.outputs.asset }} "${{ steps.package.outputs.asset }}.sha256"
