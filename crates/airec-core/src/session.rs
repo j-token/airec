@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::{
-    AirecError, ErrorCode, Event, FailurePolicy, FailureRecord, FrameProcessor, FrameSource,
-    PipelineEncoder, StopReason, SuccessRecord, TargetSummary, Timestamp, aggregate_failures,
+    AirecError, CaptureFrame, ErrorCode, Event, FailurePolicy, FailureRecord, FrameProcessor,
+    FrameSource, PipelineEncoder, StopReason, SuccessRecord, TargetSummary, Timestamp,
+    aggregate_failures,
 };
 
 pub struct Pipeline {
@@ -49,6 +50,13 @@ enum PipelineMessage {
     Event(Event),
     Failure(FailureRecord, StopReason),
     Complete(SuccessRecord),
+}
+
+enum FirstFrameResult {
+    Frame(CaptureFrame),
+    TargetLost,
+    Timeout,
+    Stopped(StopReason),
 }
 
 pub fn run_session(
@@ -189,10 +197,9 @@ fn run_pipeline(
     sender: std::sync::mpsc::Sender<PipelineMessage>,
     first_frame_barrier: Arc<std::sync::Barrier>,
 ) {
-    let first = match pipeline.source.next_frame(options.first_frame_timeout) {
-        Ok(Some(frame)) => frame,
-        Ok(None) if !pipeline.source.is_target_alive() => {
-            first_frame_barrier.wait();
+    let first = match wait_for_first_frame(pipeline.source.as_mut(), &options) {
+        Ok(FirstFrameResult::Frame(frame)) => frame,
+        Ok(FirstFrameResult::TargetLost) => {
             pipeline_failure(
                 &pipeline,
                 &options,
@@ -201,10 +208,10 @@ fn run_pipeline(
                 StopReason::TargetLost,
                 &sender,
             );
+            first_frame_barrier.wait();
             return;
         }
-        Ok(None) => {
-            first_frame_barrier.wait();
+        Ok(FirstFrameResult::Timeout) => {
             pipeline_failure(
                 &pipeline,
                 &options,
@@ -213,10 +220,27 @@ fn run_pipeline(
                 StopReason::Error,
                 &sender,
             );
+            first_frame_barrier.wait();
+            return;
+        }
+        Ok(FirstFrameResult::Stopped(stop_reason)) => {
+            let code = if stop_reason == StopReason::AbortedOnFailure {
+                ErrorCode::AbortedOnFailure
+            } else {
+                ErrorCode::CaptureInitFailed
+            };
+            pipeline_failure(
+                &pipeline,
+                &options,
+                code,
+                "recording stopped before the first frame",
+                stop_reason,
+                &sender,
+            );
+            first_frame_barrier.wait();
             return;
         }
         Err(error) => {
-            first_frame_barrier.wait();
             pipeline_failure(
                 &pipeline,
                 &options,
@@ -225,6 +249,7 @@ fn run_pipeline(
                 StopReason::Error,
                 &sender,
             );
+            first_frame_barrier.wait();
             return;
         }
     };
@@ -406,6 +431,34 @@ fn run_pipeline(
     }
 }
 
+fn wait_for_first_frame(
+    source: &mut dyn FrameSource,
+    options: &SessionRunOptions,
+) -> Result<FirstFrameResult, AirecError> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let deadline = Instant::now() + options.first_frame_timeout;
+    loop {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(POLL_INTERVAL);
+        match source.next_frame(wait)? {
+            Some(frame) => return Ok(FirstFrameResult::Frame(frame)),
+            None => {
+                if !source.is_target_alive() {
+                    return Ok(FirstFrameResult::TargetLost);
+                }
+                if let Some(stop_reason) = read_stop(&options.stop) {
+                    return Ok(FirstFrameResult::Stopped(stop_reason));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(FirstFrameResult::Timeout);
+                }
+            }
+        }
+    }
+}
+
 fn pipeline_failure(
     pipeline: &Pipeline,
     options: &SessionRunOptions,
@@ -492,6 +545,43 @@ mod tests {
         fn is_target_alive(&self) -> bool {
             self.alive
         }
+        fn is_minimized(&self) -> bool {
+            false
+        }
+    }
+
+    struct BlockingSource;
+
+    impl FrameSource for BlockingSource {
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<CaptureFrame>, AirecError> {
+            std::thread::sleep(timeout);
+            Ok(None)
+        }
+
+        fn is_target_alive(&self) -> bool {
+            true
+        }
+
+        fn is_minimized(&self) -> bool {
+            false
+        }
+    }
+
+    struct FailingSource;
+
+    impl FrameSource for FailingSource {
+        fn next_frame(&mut self, _timeout: Duration) -> Result<Option<CaptureFrame>, AirecError> {
+            Err(AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                "capture failed immediately",
+                json!({}),
+            ))
+        }
+
+        fn is_target_alive(&self) -> bool {
+            true
+        }
+
         fn is_minimized(&self) -> bool {
             false
         }
@@ -687,6 +777,38 @@ mod tests {
                 ..
             }
         )));
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            Event::Error {
+                code: ErrorCode::AbortedOnFailure,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn abort_policy_cancels_another_first_frame_wait_immediately() {
+        let mut slow = pipeline(MockSource {
+            frames: VecDeque::new(),
+            alive: true,
+        });
+        slow.source = Box::new(BlockingSource);
+        let mut bad = pipeline(MockSource {
+            frames: VecDeque::new(),
+            alive: true,
+        });
+        bad.target = "bad.mp4".into();
+        bad.output = "bad.mp4".into();
+        bad.source = Box::new(FailingSource);
+        let mut run_options = options(Duration::from_secs(1));
+        run_options.first_frame_timeout = Duration::from_secs(2);
+        run_options.failure_policy = FailurePolicy::Abort;
+
+        let started = Instant::now();
+        let outcome = run_session(vec![slow, bad], run_options, |_| {});
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(outcome.exit_code, 6);
         assert!(outcome.events.iter().any(|event| matches!(
             event,
             Event::Error {
