@@ -8,7 +8,7 @@ Every event has `event`, `ts`, `session`, and `target`. `started` is session-wid
 
 ## D-002 — Detached command event ownership
 
-`start` returns after proxying the child session's `started` event. `record` owns and emits live `heartbeat` events. `stop` proxies terminal `target_lost`, `saved`, and `error` events after finalization. `status` reports active sessions only, as FR-006 specifies. A detached child never inherits the caller's stdout/stderr handles; startup diagnostics are written to a per-session local log and replayed to the `start` caller's stderr before it returns.
+`start` returns after proxying the child session's `started` event. `record` owns and emits live `heartbeat` events. `stop` proxies terminal `target_lost`, `saved`, and `error` events after finalization. `status` reports active sessions only, as FR-006 specifies. `start` creates the detached child with `CreateProcessW` and `bInheritHandles = FALSE`, so it cannot retain the caller's stdout/stderr pipe handles after the parent exits. Startup diagnostics are written to a per-session local log and replayed to the `start` caller's stderr before it returns.
 
 ## D-003 — Window closure
 
@@ -57,3 +57,9 @@ WGC frames and `WH_MOUSE_LL` events first use one monotonic epoch created before
 ## D-014 — Doctor encoder probe
 
 `doctor` performs complete one-frame 1280×720 FMPEG4 transcodes with hardware acceleration enabled and disabled. It reports both actual availability results and the selected mode. Temporary probe files are removed; if neither mode succeeds, the command returns `ENCODER_UNAVAILABLE` (exit 3).
+
+## D-015 — Vendored windows-capture fork
+
+The workspace pins `windows-capture` 2.0.0 to `vendor/windows-capture` because the upstream 2.0.0 public encoder exposes the regular MPEG4 container but not Media Foundation's FMPEG4 fragmented container required by FR-006. The fork retains the upstream MIT `LICENCE` and changes `src/encoder.rs` to add the FMPEG4 container subtype, asynchronous transcoder error/readiness tracking, `wait_until_ready`, and `send_frame_buffer_at_timeline` so all target files preserve the shared session timeline; its stream-capture example is adjusted for the changed encoder surface.
+
+Upstream updates are tracked deliberately rather than accepted through an unconstrained Cargo upgrade. Before changing the pinned version, maintainers must compare the vendored tree with the matching upstream release, rebase this minimal fork, document any changed divergence here, retain upstream licensing, and rerun the encoder fallback/readiness tests plus live fragmented-MP4 forced-kill and multi-target timeline checks.
