@@ -6,7 +6,7 @@ pub use encoder::{EncoderDiagnostics, WindowsEncoderFactory, diagnose_encoders};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use airec_core::{
@@ -290,12 +290,14 @@ struct CaptureFlags {
     sender: Sender<CaptureMessage>,
     started_at: std::time::Instant,
     dropped: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
 }
 
 struct Handler {
     sender: Sender<CaptureMessage>,
     started_at: std::time::Instant,
     dropped: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
 }
 
 type HandlerError = Box<dyn std::error::Error + Send + Sync>;
@@ -309,6 +311,7 @@ impl GraphicsCaptureApiHandler for Handler {
             sender: context.flags.sender,
             started_at: context.flags.started_at,
             dropped: context.flags.dropped,
+            closed: context.flags.closed,
         })
     }
 
@@ -335,7 +338,8 @@ impl GraphicsCaptureApiHandler for Handler {
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
-        let _ = self.sender.send(CaptureMessage::Closed);
+        self.closed.store(true, Ordering::Release);
+        let _ = self.sender.try_send(CaptureMessage::Closed);
         Ok(())
     }
 }
@@ -343,7 +347,7 @@ impl GraphicsCaptureApiHandler for Handler {
 struct WgcFrameSource {
     receiver: Receiver<CaptureMessage>,
     control: Option<CaptureControl<Handler, HandlerError>>,
-    alive: bool,
+    closed: Arc<AtomicBool>,
     hwnd: Option<isize>,
     dropped: Arc<AtomicU64>,
     drop_baseline: Option<u64>,
@@ -369,19 +373,19 @@ impl FrameSource for WgcFrameSource {
                 Ok(Some(frame))
             }
             Ok(CaptureMessage::Closed) => {
-                self.alive = false;
+                self.closed.store(true, Ordering::Release);
                 Ok(None)
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                self.alive = false;
+                self.closed.store(true, Ordering::Release);
                 Err(capture_error("capture thread ended unexpectedly"))
             }
         }
     }
 
     fn is_target_alive(&self) -> bool {
-        self.alive
+        !self.closed.load(Ordering::Acquire)
             && self.hwnd.is_none_or(|hwnd| unsafe {
                 IsWindow(Some(windows::Win32::Foundation::HWND(
                     hwnd as *mut std::ffi::c_void,
@@ -414,10 +418,12 @@ impl CaptureBackend for WindowsCaptureBackend {
     ) -> Result<Box<dyn FrameSource>, AirecError> {
         let (sender, receiver) = crossbeam_channel::bounded(3);
         let dropped = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         let flags = CaptureFlags {
             sender,
             started_at: options.started_at,
             dropped: dropped.clone(),
+            closed: closed.clone(),
         };
         let cursor = if options.cursor {
             CursorCaptureSettings::WithCursor
@@ -484,7 +490,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         Ok(Box::new(WgcFrameSource {
             receiver,
             control: Some(control),
-            alive: true,
+            closed,
             hwnd: target.hwnd,
             dropped,
             drop_baseline: None,
@@ -544,6 +550,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn close_signal_is_recorded_when_frame_channel_is_full() {
+        let (sender, _receiver) = crossbeam_channel::bounded(1);
+        sender
+            .try_send(CaptureMessage::Frame(airec_core::CaptureFrame {
+                width: 1,
+                height: 1,
+                stride: 4,
+                bgra: vec![0; 4],
+                t_ms: 0,
+            }))
+            .unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut handler = Handler {
+            sender,
+            started_at: Instant::now(),
+            dropped: Arc::new(AtomicU64::new(0)),
+            closed: closed.clone(),
+        };
+
+        handler.on_closed().unwrap();
+
+        assert!(closed.load(Ordering::Acquire));
+    }
 
     #[test]
     fn monitor_output_names_are_one_based_and_stable() {
