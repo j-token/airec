@@ -1,10 +1,11 @@
-//! Pure CPU click-ripple compositing and resize letterboxing.
+//! Pure CPU mouse-effect compositing and resize letterboxing.
 
-use airec_core::{CaptureFrame, InputEvent, MouseButton};
+use std::collections::VecDeque;
 
-const RIPPLE_DURATION_MS: u64 = 500;
-const RIPPLE_MAX_RADIUS: f32 = 34.0;
+use airec_core::{CaptureFrame, EffectColor, EffectStyles, InputEvent, MouseButton};
+
 const RING_WIDTH: f32 = 3.0;
+const MAX_STROKE_SEGMENTS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScreenRect {
@@ -40,12 +41,64 @@ struct Ripple {
     double: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug)]
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    started_ms: u64,
+    from: Point,
+    to: Point,
+}
+
+#[derive(Clone, Debug)]
+struct DragStroke {
+    button: MouseButton,
+    segments: VecDeque<Segment>,
+    last_point: Option<Point>,
+    ended_ms: Option<u64>,
+}
+
 pub struct RippleCompositor {
+    styles: EffectStyles,
     ripples: Vec<Ripple>,
+    drag: Option<DragStroke>,
+    trail: VecDeque<Segment>,
+    last_trail_point: Option<Point>,
+    last_clip_and_mapping: Option<(ScreenRect, ScreenRect)>,
+}
+
+impl Default for RippleCompositor {
+    fn default() -> Self {
+        Self::new(EffectStyles::default())
+    }
 }
 
 impl RippleCompositor {
+    #[must_use]
+    pub const fn new(styles: EffectStyles) -> Self {
+        Self {
+            styles,
+            ripples: Vec::new(),
+            drag: None,
+            trail: VecDeque::new(),
+            last_trail_point: None,
+            last_clip_and_mapping: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn styles(&self) -> EffectStyles {
+        self.styles
+    }
+
+    pub fn set_styles(&mut self, styles: EffectStyles) {
+        self.styles = styles;
+    }
+
     pub fn push_events(
         &mut self,
         events: impl IntoIterator<Item = InputEvent>,
@@ -65,51 +118,166 @@ impl RippleCompositor {
         mapping: ScreenRect,
         frame: &CaptureFrame,
     ) {
+        if self.last_clip_and_mapping != Some((clip, mapping)) {
+            self.last_trail_point = None;
+            if let Some(drag) = &mut self.drag {
+                drag.last_point = None;
+            }
+            self.last_clip_and_mapping = Some((clip, mapping));
+        }
+
         for event in events {
-            if let InputEvent::Click {
-                t_ms,
-                button,
-                x,
-                y,
-                double,
-            } = event
-                && clip.contains(x, y)
-            {
-                let local_x =
-                    (x - mapping.left) as f32 * frame.width as f32 / mapping.width().max(1) as f32;
-                let local_y =
-                    (y - mapping.top) as f32 * frame.height as f32 / mapping.height().max(1) as f32;
-                self.ripples.push(Ripple {
-                    started_ms: t_ms,
-                    x: local_x,
-                    y: local_y,
+            match event {
+                InputEvent::Click {
+                    t_ms,
                     button,
+                    x,
+                    y,
                     double,
-                });
+                } => {
+                    if let Some(point) = map_point(x, y, clip, mapping, frame) {
+                        self.ripples.push(Ripple {
+                            started_ms: t_ms,
+                            x: point.x,
+                            y: point.y,
+                            button,
+                            double,
+                        });
+                    }
+                }
+                InputEvent::DragStart {
+                    t_ms: _,
+                    button,
+                    x,
+                    y,
+                } => {
+                    self.drag = map_point(x, y, clip, mapping, frame).map(|point| DragStroke {
+                        button,
+                        segments: VecDeque::new(),
+                        last_point: Some(point),
+                        ended_ms: None,
+                    });
+                }
+                InputEvent::Move { t_ms, x, y } => {
+                    let point = map_point(x, y, clip, mapping, frame);
+                    if let (Some(from), Some(to)) = (self.last_trail_point, point) {
+                        push_bounded_segment(
+                            &mut self.trail,
+                            Segment {
+                                started_ms: t_ms,
+                                from,
+                                to,
+                            },
+                        );
+                    }
+                    self.last_trail_point = point;
+
+                    if let Some(drag) = &mut self.drag {
+                        if let (Some(from), Some(to)) = (drag.last_point, point) {
+                            push_bounded_segment(
+                                &mut drag.segments,
+                                Segment {
+                                    started_ms: t_ms,
+                                    from,
+                                    to,
+                                },
+                            );
+                        }
+                        drag.last_point = point;
+                    }
+                }
+                InputEvent::DragEnd { t_ms, button, x, y } => {
+                    if let Some(drag) = &mut self.drag
+                        && drag.button == button
+                    {
+                        let point = map_point(x, y, clip, mapping, frame);
+                        if let (Some(from), Some(to)) = (drag.last_point, point) {
+                            push_bounded_segment(
+                                &mut drag.segments,
+                                Segment {
+                                    started_ms: t_ms,
+                                    from,
+                                    to,
+                                },
+                            );
+                        }
+                        drag.last_point = point;
+                        drag.ended_ms = Some(t_ms);
+                    }
+                }
             }
         }
     }
 
     pub fn render(&mut self, frame: &mut CaptureFrame) {
         let now = frame.t_ms;
+        let click_style = self.styles.click;
         self.ripples
-            .retain(|ripple| now.saturating_sub(ripple.started_ms) <= RIPPLE_DURATION_MS);
+            .retain(|ripple| now.saturating_sub(ripple.started_ms) <= click_style.duration_ms);
         for ripple in &self.ripples {
             let age = now.saturating_sub(ripple.started_ms);
-            if age > RIPPLE_DURATION_MS {
+            if age > click_style.duration_ms {
                 continue;
             }
-            let progress = age as f32 / RIPPLE_DURATION_MS as f32;
-            let radius = 6.0 + RIPPLE_MAX_RADIUS * progress;
+            let progress = age as f32 / click_style.duration_ms.max(1) as f32;
+            let radius = 6.0 + click_style.size.max(0.0) * progress;
             let alpha = 1.0 - progress;
-            draw_ring(frame, ripple.x, ripple.y, radius, ripple.button, alpha);
+            let color = match ripple.button {
+                MouseButton::Left => click_style.left_color,
+                MouseButton::Right => click_style.right_color,
+            };
+            draw_ring(frame, ripple.x, ripple.y, radius, color, alpha);
             if ripple.double {
                 draw_ring(
                     frame,
                     ripple.x,
                     ripple.y,
                     (radius - 7.0).max(2.0),
-                    ripple.button,
+                    color,
+                    alpha,
+                );
+            }
+        }
+
+        let trail_style = self.styles.trail;
+        while self
+            .trail
+            .front()
+            .is_some_and(|segment| now.saturating_sub(segment.started_ms) > trail_style.duration_ms)
+        {
+            self.trail.pop_front();
+        }
+        for segment in &self.trail {
+            let age = now.saturating_sub(segment.started_ms);
+            let alpha = 1.0 - age as f32 / trail_style.duration_ms.max(1) as f32;
+            draw_line(
+                frame,
+                segment.from,
+                segment.to,
+                trail_style.color,
+                trail_style.size,
+                alpha,
+            );
+        }
+
+        let drag_style = self.styles.drag;
+        if self.drag.as_ref().is_some_and(|drag| {
+            drag.ended_ms
+                .is_some_and(|ended| now.saturating_sub(ended) > drag_style.duration_ms)
+        }) {
+            self.drag = None;
+        }
+        if let Some(drag) = &self.drag {
+            let alpha = drag.ended_ms.map_or(1.0, |ended| {
+                1.0 - now.saturating_sub(ended) as f32 / drag_style.duration_ms.max(1) as f32
+            });
+            for segment in &drag.segments {
+                draw_line(
+                    frame,
+                    segment.from,
+                    segment.to,
+                    drag_style.color,
+                    drag_style.size,
                     alpha,
                 );
             }
@@ -117,20 +285,40 @@ impl RippleCompositor {
     }
 }
 
+/// Additive name for callers that composite all v0.2 mouse effects.
+pub type EffectCompositor = RippleCompositor;
+
+fn map_point(
+    x: i32,
+    y: i32,
+    clip: ScreenRect,
+    mapping: ScreenRect,
+    frame: &CaptureFrame,
+) -> Option<Point> {
+    clip.contains(x, y).then(|| Point {
+        x: (x - mapping.left) as f32 * frame.width as f32 / mapping.width().max(1) as f32,
+        y: (y - mapping.top) as f32 * frame.height as f32 / mapping.height().max(1) as f32,
+    })
+}
+
+fn push_bounded_segment(segments: &mut VecDeque<Segment>, segment: Segment) {
+    if segment.from.x == segment.to.x && segment.from.y == segment.to.y {
+        return;
+    }
+    if segments.len() == MAX_STROKE_SEGMENTS {
+        segments.pop_front();
+    }
+    segments.push_back(segment);
+}
+
 fn draw_ring(
     frame: &mut CaptureFrame,
     center_x: f32,
     center_y: f32,
     radius: f32,
-    button: MouseButton,
+    color: EffectColor,
     alpha: f32,
 ) {
-    let color = match button {
-        // BGRA: #FFD400
-        MouseButton::Left => [0x00, 0xD4, 0xFF],
-        // BGRA: #00A2FF
-        MouseButton::Right => [0xFF, 0xA2, 0x00],
-    };
     let outer = radius + RING_WIDTH;
     let min_x = (center_x - outer).floor().max(0.0) as u32;
     let max_x = (center_x + outer)
@@ -154,12 +342,53 @@ fn draw_ring(
     }
 }
 
-fn blend_bgra(frame: &mut CaptureFrame, x: u32, y: u32, color: [u8; 3], alpha: f32) {
+fn draw_line(
+    frame: &mut CaptureFrame,
+    from: Point,
+    to: Point,
+    color: EffectColor,
+    width: f32,
+    alpha: f32,
+) {
+    let radius = width.max(0.0) / 2.0;
+    if radius == 0.0 || alpha <= 0.0 || frame.width == 0 || frame.height == 0 {
+        return;
+    }
+    let min_x = (from.x.min(to.x) - radius).floor().max(0.0) as u32;
+    let max_x = (from.x.max(to.x) + radius)
+        .ceil()
+        .min(frame.width.saturating_sub(1) as f32) as u32;
+    let min_y = (from.y.min(to.y) - radius).floor().max(0.0) as u32;
+    let max_y = (from.y.max(to.y) + radius)
+        .ceil()
+        .min(frame.height.saturating_sub(1) as f32) as u32;
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let length_squared = dx * dx + dy * dy;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let projection =
+                (((px - from.x) * dx + (py - from.y) * dy) / length_squared).clamp(0.0, 1.0);
+            let closest_x = from.x + projection * dx;
+            let closest_y = from.y + projection * dy;
+            let distance = ((px - closest_x).powi(2) + (py - closest_y).powi(2)).sqrt();
+            if distance <= radius {
+                let coverage = (1.0 - distance / radius).clamp(0.0, 1.0) * alpha;
+                blend_bgra(frame, x, y, color, coverage);
+            }
+        }
+    }
+}
+
+fn blend_bgra(frame: &mut CaptureFrame, x: u32, y: u32, color: EffectColor, alpha: f32) {
     let offset = y as usize * frame.stride as usize + x as usize * 4;
     if offset + 3 >= frame.bgra.len() {
         return;
     }
-    for (channel, source) in color.into_iter().enumerate() {
+    let bgra = [color.blue, color.green, color.red];
+    for (channel, source) in bgra.into_iter().enumerate() {
         let destination = f32::from(frame.bgra[offset + channel]);
         frame.bgra[offset + channel] =
             (destination * (1.0 - alpha) + f32::from(source) * alpha) as u8;
@@ -297,6 +526,180 @@ mod tests {
             &template,
         );
         let mut expired = frame(100, 100, 501);
+        compositor.render(&mut expired);
+        assert!(expired.bgra.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn custom_click_style_controls_color_size_and_duration() {
+        let mut styles = EffectStyles::default();
+        styles.click.left_color = EffectColor::rgb(255, 0, 0);
+        styles.click.size = 10.0;
+        styles.click.duration_ms = 100;
+        let mut compositor = RippleCompositor::new(styles);
+        let viewport = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let template = frame(100, 100, 0);
+        compositor.push_events(
+            [InputEvent::Click {
+                t_ms: 0,
+                button: MouseButton::Left,
+                x: 50,
+                y: 50,
+                double: false,
+            }],
+            viewport,
+            &template,
+        );
+        let mut visible = frame(100, 100, 50);
+        compositor.render(&mut visible);
+        assert!(
+            visible
+                .bgra
+                .chunks_exact(4)
+                .any(|pixel| { pixel[2] > 0 && pixel[0] == 0 && pixel[1] == 0 })
+        );
+
+        let mut expired = frame(100, 100, 101);
+        compositor.render(&mut expired);
+        assert!(expired.bgra.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn drag_trajectory_is_composited_and_expires() {
+        let mut styles = EffectStyles::default();
+        styles.drag.color = EffectColor::rgb(0, 255, 0);
+        styles.drag.size = 8.0;
+        styles.drag.duration_ms = 30;
+        styles.trail.size = 0.0;
+        let mut compositor = RippleCompositor::new(styles);
+        let viewport = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let template = frame(100, 100, 0);
+        compositor.push_events(
+            [
+                InputEvent::DragStart {
+                    t_ms: 0,
+                    button: MouseButton::Left,
+                    x: 10,
+                    y: 50,
+                },
+                InputEvent::Move {
+                    t_ms: 10,
+                    x: 50,
+                    y: 50,
+                },
+                InputEvent::DragEnd {
+                    t_ms: 20,
+                    button: MouseButton::Left,
+                    x: 90,
+                    y: 50,
+                },
+            ],
+            viewport,
+            &template,
+        );
+        let mut visible = frame(100, 100, 20);
+        compositor.render(&mut visible);
+        assert!(
+            visible
+                .bgra
+                .chunks_exact(4)
+                .any(|pixel| { pixel[1] > 0 && pixel[0] == 0 && pixel[2] == 0 })
+        );
+
+        let mut expired = frame(100, 100, 51);
+        compositor.render(&mut expired);
+        assert!(expired.bgra.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn outside_moves_break_trail_and_drag_segments() {
+        let mut compositor = RippleCompositor::default();
+        let viewport = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 100,
+            bottom: 100,
+        };
+        let template = frame(100, 100, 0);
+        compositor.push_events(
+            [
+                InputEvent::DragStart {
+                    t_ms: 0,
+                    button: MouseButton::Left,
+                    x: 10,
+                    y: 50,
+                },
+                InputEvent::Move {
+                    t_ms: 10,
+                    x: 110,
+                    y: 50,
+                },
+                InputEvent::Move {
+                    t_ms: 20,
+                    x: 90,
+                    y: 50,
+                },
+                InputEvent::DragEnd {
+                    t_ms: 30,
+                    button: MouseButton::Left,
+                    x: 90,
+                    y: 50,
+                },
+            ],
+            viewport,
+            &template,
+        );
+        let mut target = frame(100, 100, 30);
+        compositor.render(&mut target);
+        assert!(target.bgra.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn movement_trail_maps_through_moved_viewport() {
+        let mut styles = EffectStyles::default();
+        styles.trail.color = EffectColor::rgb(0, 0, 255);
+        styles.trail.size = 10.0;
+        styles.trail.duration_ms = 20;
+        let mut compositor = RippleCompositor::new(styles);
+        let viewport = ScreenRect {
+            left: 500,
+            top: 300,
+            right: 600,
+            bottom: 400,
+        };
+        let template = frame(200, 200, 0);
+        compositor.push_events(
+            [
+                InputEvent::Move {
+                    t_ms: 0,
+                    x: 525,
+                    y: 350,
+                },
+                InputEvent::Move {
+                    t_ms: 10,
+                    x: 575,
+                    y: 350,
+                },
+            ],
+            viewport,
+            &template,
+        );
+        let mut target = frame(200, 200, 10);
+        compositor.render(&mut target);
+        let pixel = &target.bgra[103 * 800 + 100 * 4..][..3];
+        assert!(pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0);
+
+        let mut expired = frame(200, 200, 31);
         compositor.render(&mut expired);
         assert!(expired.bgra.iter().all(|byte| *byte == 0));
     }
