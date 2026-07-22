@@ -3,7 +3,12 @@ use std::process::Command;
 #[test]
 fn structured_no_session_error_has_prd_exit_and_one_json_line() {
     let output = Command::new(env!("CARGO_BIN_EXE_airec"))
-        .args(["stop", "--session", "definitely-not-an-airec-session", "--json"])
+        .args([
+            "stop",
+            "--session",
+            "definitely-not-an-airec-session",
+            "--json",
+        ])
         .output()
         .expect("run airec");
     assert_eq!(output.status.code(), Some(4));

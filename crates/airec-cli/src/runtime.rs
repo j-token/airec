@@ -414,7 +414,12 @@ fn session_child(config_path: &Path) -> Result<i32, AirecError> {
                                 .events
                                 .iter()
                                 .filter(|event| {
-                                    matches!(event, Event::TargetLost { .. } | Event::Saved { .. } | Event::Error { .. })
+                                    matches!(
+                                        event,
+                                        Event::TargetLost { .. }
+                                            | Event::Saved { .. }
+                                            | Event::Error { .. }
+                                    )
                                 })
                                 .cloned()
                                 .collect();
@@ -503,7 +508,11 @@ fn run_live(
     if options.verbose {
         eprintln!(
             "airec: session {session}, {} target(s), {} fps, {:?} quality, cursor={}, effects={}",
-            targets.len(), options.fps, options.quality, options.cursor, options.effects
+            targets.len(),
+            options.fps,
+            options.quality,
+            options.cursor,
+            options.effects
         );
     }
     let mut pipelines = Vec::new();

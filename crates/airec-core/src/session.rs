@@ -547,11 +547,7 @@ mod tests {
         });
         bad.target = "bad.mp4".into();
         bad.output = "bad.mp4".into();
-        let outcome = run_session(
-            vec![good, bad],
-            options(Duration::from_millis(35)),
-            |_| {},
-        );
+        let outcome = run_session(vec![good, bad], options(Duration::from_millis(35)), |_| {});
         assert_eq!(outcome.exit_code, 6);
         assert!(outcome.events.iter().any(|event| matches!(
             event,
