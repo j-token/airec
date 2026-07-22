@@ -131,7 +131,12 @@ pub fn run_session(
                 completed += 1;
             }
         }
-        if !started_emitted && startup_resolved == target_count && !started_targets.is_empty() {
+        let startup_abort = options.failure_policy == FailurePolicy::Abort && !failures.is_empty();
+        if !started_emitted
+            && !startup_abort
+            && startup_resolved == target_count
+            && !started_targets.is_empty()
+        {
             let event = Event::Started {
                 ts: Timestamp::now(),
                 session: options.session.clone(),
@@ -809,6 +814,12 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(outcome.exit_code, 6);
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Started { .. }))
+        );
         assert!(outcome.events.iter().any(|event| matches!(
             event,
             Event::Error {
