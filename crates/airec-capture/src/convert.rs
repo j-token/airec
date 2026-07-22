@@ -255,6 +255,9 @@ struct TimestampSampler {
     first_timestamp: Option<i64>,
     next_sample_slot: u64,
     source_end_hns: u64,
+    last_source_timestamp_hns: Option<u64>,
+    last_positive_delta_hns: Option<u64>,
+    last_sample_duration_hns: u64,
 }
 
 struct SampleTiming {
@@ -269,12 +272,22 @@ impl TimestampSampler {
             first_timestamp: None,
             next_sample_slot: 0,
             source_end_hns: 0,
+            last_source_timestamp_hns: None,
+            last_positive_delta_hns: None,
+            last_sample_duration_hns: 0,
         }
     }
 
     fn observe(&mut self, timestamp: i64, duration_hns: u64) -> SampleTiming {
         let base = *self.first_timestamp.get_or_insert(timestamp);
         let relative_hns = timestamp.saturating_sub(base).max(0) as u64;
+        if let Some(previous_hns) = self.last_source_timestamp_hns
+            && relative_hns > previous_hns
+        {
+            self.last_positive_delta_hns = Some(relative_hns - previous_hns);
+        }
+        self.last_source_timestamp_hns = Some(relative_hns);
+        self.last_sample_duration_hns = duration_hns;
         self.source_end_hns = self
             .source_end_hns
             .max(relative_hns.saturating_add(duration_hns));
@@ -295,11 +308,21 @@ impl TimestampSampler {
     }
 
     fn end_hns(&self, last_frame_start_hns: u64) -> u64 {
-        if self.source_end_hns > last_frame_start_hns {
-            self.source_end_hns
+        let nominal_frame_hns =
+            u64::try_from(HNS_PER_SECOND.div_ceil(u128::from(self.fps))).unwrap_or(u64::MAX);
+        let final_frame_duration_hns = if self.last_sample_duration_hns != 0 {
+            self.last_sample_duration_hns
         } else {
-            let nominal_frame_hns =
-                u64::try_from(HNS_PER_SECOND.div_ceil(u128::from(self.fps))).unwrap_or(u64::MAX);
+            self.last_positive_delta_hns.unwrap_or(nominal_frame_hns)
+        };
+        let inferred_source_end_hns = self
+            .last_source_timestamp_hns
+            .unwrap_or(last_frame_start_hns)
+            .saturating_add(final_frame_duration_hns);
+        let end_hns = self.source_end_hns.max(inferred_source_end_hns);
+        if end_hns > last_frame_start_hns {
+            end_hns
+        } else {
             last_frame_start_hns.saturating_add(nominal_frame_hns)
         }
     }
@@ -1038,6 +1061,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(delays, [50, 150, 50]);
         assert_eq!(delays.into_iter().sum::<u64>(), 250);
+    }
+
+    #[test]
+    fn missing_final_duration_uses_last_source_timestamp_delta() {
+        let mut sampler = TimestampSampler::new(10);
+        let first = sampler.observe(0, 0);
+        let second = sampler.observe(10_000_000, 0);
+        assert!(first.selected);
+        assert!(second.selected);
+        assert_eq!(sampler.end_hns(second.relative_hns), 20_000_000);
+        assert_eq!(
+            timeline_delay_centiseconds(second.relative_hns, sampler.end_hns(second.relative_hns)),
+            100
+        );
     }
 
     #[test]
