@@ -1,0 +1,25 @@
+airec
+Copyright 2026 j-token
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+--------------------------------------------------------------------------------
+
+vendor/windows-capture
+    A modified copy of the windows-capture crate, version 2.0.0, by NiiightmareXD.
+    Licensed under the MIT License. The original license text is retained at
+    vendor/windows-capture/LICENCE and continues to govern that directory.
+    Upstream: https://github.com/NiiightmareXD/windows-capture
+    Modifications are described in DECISIONS.md, entry D-015.

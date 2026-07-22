@@ -1,0 +1,316 @@
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "airec",
+    version,
+    about = "Windows CLI screen recorder for AI work evidence"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Enumerate capturable monitors or windows.
+    List(ListArgs),
+    /// Record in the foreground until duration or Ctrl+C.
+    Record(RecordArgs),
+    /// Start a detached recording session.
+    Start(StartArgs),
+    /// List active recording sessions.
+    Status(JsonArgs),
+    /// Finalize and stop a detached recording session.
+    Stop(StopArgs),
+    /// Diagnose Windows Graphics Capture and encoder configuration.
+    Doctor(JsonArgs),
+    /// Convert a recorded MP4 to an animated GIF.
+    Convert(ConvertArgs),
+    #[command(name = "_session", hide = true)]
+    Session(SessionArgs),
+    #[cfg(debug_assertions)]
+    #[command(name = "_test_hold", hide = true)]
+    TestHold(TestHoldArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[command(subcommand)]
+    pub kind: ListKind,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ListKind {
+    Monitors(JsonArgs),
+    Windows(JsonArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct JsonArgs {
+    /// Emit machine-readable JSON/JSONL to stdout.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordArgs {
+    #[command(flatten)]
+    pub targets: TargetArgs,
+    #[command(flatten)]
+    pub recording: RecordingArgs,
+    /// Foreground recording duration, for example 30s or 2m; omit to use Ctrl+C.
+    #[arg(long)]
+    pub duration: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StartArgs {
+    #[command(flatten)]
+    pub targets: TargetArgs,
+    #[command(flatten)]
+    pub recording: RecordingArgs,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct TargetArgs {
+    /// One-based monitor index, repeatable, or `all`.
+    #[arg(long)]
+    pub monitor: Vec<String>,
+    /// Window title substring; repeat for multiple windows.
+    #[arg(long)]
+    pub window: Vec<String>,
+    /// Decimal or 0x-prefixed HWND; repeat for multiple windows.
+    #[arg(long = "window-handle", value_parser = parse_hwnd)]
+    pub window_handle: Vec<isize>,
+    /// Process executable name; all matching top-level windows are recorded.
+    #[arg(long)]
+    pub process: Vec<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RecordingArgs {
+    /// Output file for a single target.
+    #[arg(long, conflicts_with = "out_dir")]
+    pub out: Option<PathBuf>,
+    /// Output directory for multiple targets.
+    #[arg(long, conflicts_with = "out")]
+    pub out_dir: Option<PathBuf>,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+    pub fps: Option<u32>,
+    #[arg(long, value_enum)]
+    pub quality: Option<QualityArg>,
+    #[arg(long)]
+    pub no_cursor: bool,
+    /// Include the cursor even when the config default is disabled.
+    #[arg(long, conflicts_with = "no_cursor")]
+    pub cursor: bool,
+    #[arg(long)]
+    pub no_effects: bool,
+    /// Enable effects even when the config default is disabled.
+    #[arg(long, conflicts_with = "no_effects")]
+    pub effects: bool,
+    #[arg(long)]
+    pub max_duration: Option<String>,
+    #[arg(long, value_enum)]
+    pub on_failure: Option<FailureArg>,
+    #[arg(long)]
+    pub click_color_left: Option<String>,
+    #[arg(long)]
+    pub click_color_right: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub click_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub click_duration_ms: Option<u64>,
+    #[arg(long)]
+    pub drag_color: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub drag_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drag_duration_ms: Option<u64>,
+    #[arg(long)]
+    pub trail_color: Option<String>,
+    #[arg(long, value_parser = parse_positive_f32)]
+    pub trail_size: Option<f32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub trail_duration_ms: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub drag_threshold_px: Option<u32>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub drag_threshold_ms: Option<u64>,
+    #[arg(long)]
+    pub event_log: Option<PathBuf>,
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum QualityArg {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum FailureArg {
+    Continue,
+    Abort,
+}
+
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    #[arg(long)]
+    pub session: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    #[arg(long)]
+    pub config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ConvertArgs {
+    /// Source MP4 recorded by airec.
+    pub input: PathBuf,
+    /// Destination GIF. Defaults to the input path with a .gif extension.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Output frame rate.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=60))]
+    pub fps: u32,
+    /// Maximum output width; aspect ratio is preserved and smaller inputs are not enlarged.
+    #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u32).range(1..))]
+    pub width: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Args)]
+pub struct TestHoldArgs {
+    #[arg(long)]
+    pub ready: PathBuf,
+    #[arg(long)]
+    pub hold_ms: u64,
+}
+
+fn parse_hwnd(value: &str) -> Result<isize, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        isize::from_str_radix(hex, 16).map_err(|error| error.to_string())
+    } else {
+        value
+            .parse()
+            .map_err(|error: std::num::ParseIntError| error.to_string())
+    }
+}
+
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let parsed = value.parse::<f32>().map_err(|error| error.to_string())?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("value must be a finite number greater than zero".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::*;
+
+    #[test]
+    fn clap_contract_is_internally_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn repeated_targets_and_hex_hwnd_parse() {
+        let cli = Cli::try_parse_from([
+            "airec",
+            "start",
+            "--monitor",
+            "1",
+            "--monitor",
+            "2",
+            "--window",
+            "App",
+            "--window-handle",
+            "0x1a2b",
+            "--out-dir",
+            "rec",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start")
+        };
+        assert_eq!(args.targets.monitor, ["1", "2"]);
+        assert_eq!(args.targets.window_handle, [0x1a2b]);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn fps_above_sixty_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["airec", "record", "--duration", "1s", "--fps", "61"]).is_err()
+        );
+    }
+
+    #[test]
+    fn record_duration_is_optional_for_ctrl_c_mode() {
+        let cli = Cli::try_parse_from(["airec", "record", "--no-effects"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record")
+        };
+        assert!(args.duration.is_none());
+    }
+
+    #[test]
+    fn config_backed_recording_values_remain_absent_when_not_on_cli() {
+        let cli = Cli::try_parse_from(["airec", "start"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start")
+        };
+        assert_eq!(args.recording.fps, None);
+        assert!(args.recording.quality.is_none());
+        assert!(args.recording.max_duration.is_none());
+        assert!(args.recording.on_failure.is_none());
+    }
+
+    #[test]
+    fn convert_contract_parses() {
+        let cli = Cli::try_parse_from([
+            "airec",
+            "convert",
+            "evidence.mp4",
+            "--out",
+            "evidence.gif",
+            "--fps",
+            "12",
+            "--width",
+            "640",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert_eq!(args.input, PathBuf::from("evidence.mp4"));
+        assert_eq!(args.fps, 12);
+        assert_eq!(args.width, 640);
+        assert!(args.json);
+    }
+}

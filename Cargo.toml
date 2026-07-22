@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "crates/airec-capture",
+    "crates/airec-cli",
+    "crates/airec-core",
+    "crates/airec-effects",
+    "crates/airec-input",
+]
+exclude = ["vendor/windows-capture"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+ctrlc = "3.4"
+interprocess = "2.2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "=0.8.2"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-capture = { version = "2.0.0", path = "vendor/windows-capture" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
