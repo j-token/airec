@@ -42,10 +42,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
-windows-capture = "2.0.0"
+windows-capture = { version = "2.0.0", path = "vendor/windows-capture" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-

@@ -2,3 +2,8 @@
 *.mp4
 *.jsonl
 /airec-*/
+/vendor/windows-capture/*
+!/vendor/windows-capture/Cargo.toml
+!/vendor/windows-capture/LICENCE
+!/vendor/windows-capture/src/
+!/vendor/windows-capture/src/**

@@ -29,9 +29,9 @@ impl Quality {
     pub fn bitrate(self, width: u32, height: u32, fps: u32) -> u32 {
         let pixels_per_second = width as u64 * height as u64 * fps as u64;
         let divisor = match self {
-            Self::Low => 20,
-            Self::Medium => 14,
-            Self::High => 9,
+            Self::Low => 36,
+            Self::Medium => 24,
+            Self::High => 14,
         };
         let bits = pixels_per_second / divisor;
         bits.clamp(500_000, 25_000_000) as u32

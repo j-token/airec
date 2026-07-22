@@ -38,3 +38,6 @@ The process opts into Per-Monitor-V2 DPI awareness. Mouse-hook screen coordinate
 
 Named pipes remain the control transport (`\\.\pipe\airec-<session-id>`). Small local state files under the user's temporary directory are only a discovery index and crash-recovery status cache; they contain session metadata and output paths, never captured pixels or input beyond an explicitly requested event log.
 
+## D-010 — Odd capture dimensions
+
+H.264 4:2:0 encoders require even dimensions. If a monitor or window has an odd physical dimension, the fixed session canvas is expanded by one black pixel on that axis. The captured content is not cropped or distorted.
