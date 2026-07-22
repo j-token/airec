@@ -213,7 +213,7 @@ airec start --window "Chrome" --window "Windows Terminal" --out-dir ./rec --json
 - GIF/WebM 내보내기(`airec convert` 또는 `--format`)
 - 설정 파일(`airec.toml`) 지원
 - 창 이동·리사이즈 추적 개선, 창 닫힘 시 우아한 종료 보장 강화
-- Claude Code용 스킬(`SKILL.md`) 패키지 동봉 — 에이전트가 airec 사용법을 즉시 아는 상태로 시작
+- Claude Code용 스킬(`SKILL.md`) 패키지 동봉 — 에이전트가 airec 사용법을 즉시 아는 상태로 시작. 스킬에는 `--on-failure` 정책 선택 기준(증거 일부라도 확보 = continue / 완전한 증거만 유효 = abort)과 `stop_reason`으로 의도된 종료·비의도 종료를 판정하는 방법을 반드시 명시한다
 
 ### 7.3 v0.3 범위
 
@@ -262,11 +262,15 @@ airec start --window "Chrome" --window "Windows Terminal" --out-dir ./rec --json
 - `--monitor all` 또는 `--monitor 1 --monitor 2`
 - 출력은 `--out-dir` 아래 `monitor-<index>.mp4` (또는 `--out` 템플릿)
 - 모니터별 캡처·인코딩 파이프라인은 독립 스레드로 병렬 실행
+- 실패 정책 옵션 `--on-failure <continue|abort>` (기본 `continue`, 다중 창 녹화에도 동일 적용):
+  - `continue`: 실패한 대상만 중단하고 나머지는 계속. 종료 시 `PARTIAL_FAILURE`로 성공/실패 내역을 모두 보고
+  - `abort`: 한 대상이라도 실패하면 전체 세션을 즉시 finalize하고 실패로 종료. 이때도 나머지 대상의 그 시점까지 영상은 재생 가능하게 저장
 
 수용 기준:
 
 - 모니터 3대 환경에서 `--monitor all`로 3개 파일이 생성되고 각 파일 길이 차이가 1초 이내다.
-- 1개 모니터 캡처가 실패해도 나머지 파일은 정상 저장되고, 실패는 `error` 이벤트로 보고된다.
+- `continue`(기본): 1개 모니터 캡처가 실패해도 나머지 파일은 정상 저장되고, 실패는 `error` 이벤트와 `PARTIAL_FAILURE`(종료 코드 6)로 보고된다.
+- `abort`: 1개 대상 실패 시 전체 세션이 finalize되어 종료되고, 종료 사유가 `aborted_on_failure`로, 원인 대상이 이벤트에 명시된다.
 
 ### FR-004: 단일 윈도우 녹화
 
@@ -328,6 +332,10 @@ airec start --window "Chrome" --window "Windows Terminal" --out-dir ./rec --json
 
 - 이벤트 종류: `started`, `heartbeat`(기본 5초 간격: 경과·프레임·드롭 수), `target_lost`, `saved`, `error`
 - 모든 이벤트에 `ts`(ISO 8601), `session`, `target` 필드 포함
+- 모든 종료(`saved` 이벤트, 세션 종료)에 `stop_reason` 필드로 의도된 종료와 의도치 않은 종료를 명확히 구분:
+  - 의도된 종료: `requested`(stop 명령), `duration_limit`(--duration 도달), `max_duration`(--max-duration 상한)
+  - 의도치 않은 종료: `target_lost`(창 닫힘), `error`(파이프라인 실패), `aborted_on_failure`(다른 대상 실패로 abort 정책 발동)
+  - AI 에이전트는 `stop_reason`이 의도된 종료군인지 확인하는 것만으로 "정상적으로 끝났는가"를 판정할 수 있어야 한다
 - `--json` 미지정 시 사람용 한 줄 로그 출력 (예: `● REC monitor-1 00:00:12  360 frames`)
 - 진단 로그는 stderr, 이벤트는 stdout으로 분리
 
@@ -336,7 +344,7 @@ airec start --window "Chrome" --window "Windows Terminal" --out-dir ./rec --json
 ```json
 {"event":"started","ts":"2026-07-22T10:00:00.120Z","session":"a1b2","targets":[{"type":"window","title":"MyApp","file":"evidence.mp4"}]}
 {"event":"heartbeat","ts":"2026-07-22T10:00:05.120Z","session":"a1b2","target":"evidence.mp4","elapsed_ms":5000,"frames":300,"dropped":0}
-{"event":"saved","ts":"2026-07-22T10:00:42.300Z","session":"a1b2","target":"evidence.mp4","file":"C:\\work\\evidence.mp4","duration_ms":42180,"frames":2530,"size_bytes":8412345}
+{"event":"saved","ts":"2026-07-22T10:00:42.300Z","session":"a1b2","target":"evidence.mp4","file":"C:\\work\\evidence.mp4","stop_reason":"requested","duration_ms":42180,"frames":2530,"size_bytes":8412345}
 ```
 
 수용 기준:
@@ -508,6 +516,7 @@ airec stop [--session <id>] [--json]
 # 공통 옵션
 --out <file> | --out-dir <dir>    --fps <n=30>    --quality low|medium|high
 --no-cursor    --no-effects    --max-duration <t=30m>    --verbose
+--on-failure continue|abort   # 다중 대상 중 일부 실패 시 정책 (기본 continue)
 
 # 진단
 airec doctor [--json]     # 인코더 가용성, WGC 지원, (v0.3) OS 권한 상태
@@ -552,7 +561,8 @@ click_color_right = "#00A2FF"
 | `NO_ACTIVE_SESSION` | stop/status 대상 세션 없음 | 4 |
 | `SESSION_AMBIGUOUS` | stop 대상 세션이 복수 | 4 |
 | `OUTPUT_IO_ERROR` | 파일 쓰기 실패(디스크 부족 등) | 5 |
-| `PARTIAL_FAILURE` | 다중 대상 중 일부 실패, 나머지는 저장됨 | 6 |
+| `PARTIAL_FAILURE` | 다중 대상 중 일부 실패, 나머지는 저장됨 (`--on-failure continue`) | 6 |
+| `ABORTED_ON_FAILURE` | 대상 실패로 전체 세션 중단 (`--on-failure abort`), 원인 대상 포함 | 6 |
 | `PERMISSION_DENIED` | (v0.3) OS 화면 기록 권한 없음 | 7 |
 
 원칙: 부분 실패(`PARTIAL_FAILURE`)는 성공한 파일 목록과 실패한 대상·사유를 모두 `data`에 담는다.
@@ -659,6 +669,8 @@ click_color_right = "#00A2FF"
 | 입력 수집 | WH_MOUSE_LL 마우스 훅만, 키보드 제외 |
 | 세션 제어 | detach 세션 프로세스 + named pipe, 상주 데몬 없음 |
 | 상태 프로토콜 | stdout JSONL (`--json`), 진단은 stderr |
+| 다중 대상 실패 정책 | `--on-failure continue`(기본) / `abort` 선택제 |
+| 종료 사유 구분 | 모든 종료에 `stop_reason` 필수 — 의도(requested/duration_limit/max_duration) vs 비의도(target_lost/error/aborted_on_failure) |
 | 오디오 | v0.1~v0.3 비목표 |
 | 플랫폼 순서 | Windows → macOS → Linux |
 
@@ -688,6 +700,8 @@ v0.1 릴리즈 게이트 체크리스트.
 - [ ] 세션 프로세스 강제 kill 후에도 기록분 재생 가능
 - [ ] `--json` 전체 이벤트가 줄 단위 유효 JSON
 - [ ] Ctrl+C로 중단해도 파일 정상
+- [ ] 모든 종료 경로(stop, duration, 창 닫힘, 실패, abort)에서 `stop_reason`이 올바르게 구분되어 기록됨
+- [ ] `--on-failure continue`: 일부 실패 시 나머지 저장 + 종료 코드 6 / `abort`: 전체 finalize 후 실패 종료
 
 호환·환경:
 
