@@ -116,7 +116,13 @@ Errors are structured, and the exit code matches the code:
 
 `AMBIGUOUS_TARGET` returns the candidate windows in `data`, so an agent can narrow the query on its own instead of guessing.
 
-`skill/SKILL.md` packages all of this as a Claude Code skill. Copy the directory into your user or project skill location and the agent starts out knowing the commands and the `stop_reason` rule.
+All of this is packaged as an agent skill under `skills/airec`, so the agent starts out knowing the commands and the `stop_reason` rule:
+
+```powershell
+npx skills add j-token/screen-recorder-cli --skill airec
+```
+
+Add `-g` to install it for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
 
 ## Pointer effects
 
