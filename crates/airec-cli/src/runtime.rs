@@ -1098,11 +1098,23 @@ fn resolve_recording_options(
         input.drag_threshold_ms,
         "effects.drag_threshold_ms",
     )?;
-    let max_duration = recording
-        .max_duration
-        .as_deref()
-        .or(config.defaults.max_duration.as_deref())
-        .unwrap_or("30m");
+    let max_duration = if let Some(value) = recording.max_duration.as_deref() {
+        parse_duration(value)?
+    } else if let Some(value) = config.defaults.max_duration.as_deref() {
+        parse_duration(value).map_err(|error| {
+            AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                error.message,
+                serde_json::json!({
+                    "component": "config",
+                    "key": "defaults.max_duration",
+                    "value": value,
+                }),
+            )
+        })?
+    } else {
+        Duration::from_secs(30 * 60)
+    };
     Ok(RecordingOptions {
         started_at: Instant::now(),
         fps,
@@ -1111,7 +1123,7 @@ fn resolve_recording_options(
         effects,
         effect_styles,
         input,
-        max_duration: parse_duration(max_duration)?,
+        max_duration,
         first_frame_timeout: airec_core::FIRST_FRAME_TIMEOUT,
         failure_policy,
         event_log: recording.event_log.clone(),
@@ -1163,17 +1175,23 @@ fn resolve_color(
     default: EffectColor,
     key: &str,
 ) -> Result<EffectColor, AirecError> {
-    cli.or(config)
-        .map_or(Ok(default), |value| parse_color(value, key))
+    if let Some(value) = cli {
+        parse_color(value, key, "cli")
+    } else if let Some(value) = config {
+        parse_color(value, key, "config")
+    } else {
+        Ok(default)
+    }
 }
 
-fn parse_color(value: &str, key: &str) -> Result<EffectColor, AirecError> {
+fn parse_color(value: &str, key: &str, component: &str) -> Result<EffectColor, AirecError> {
     let hex = value
         .strip_prefix('#')
         .filter(|hex| hex.len() == 6)
-        .ok_or_else(|| config_value_error(key, "must use #RRGGBB"))?;
+        .ok_or_else(|| value_error(component, key, "must use #RRGGBB"))?;
     let channel = |range| {
-        u8::from_str_radix(&hex[range], 16).map_err(|_| config_value_error(key, "must use #RRGGBB"))
+        u8::from_str_radix(&hex[range], 16)
+            .map_err(|_| value_error(component, key, "must use #RRGGBB"))
     };
     Ok(EffectColor::rgb(
         channel(0..2)?,
@@ -1225,10 +1243,14 @@ fn resolve_positive_u32(
 }
 
 fn config_value_error(key: &str, message: &str) -> AirecError {
+    value_error("config", key, message)
+}
+
+fn value_error(component: &str, key: &str, message: &str) -> AirecError {
     AirecError::new(
         ErrorCode::CaptureInitFailed,
-        format!("invalid config value {key}: {message}"),
-        serde_json::json!({"component": "config", "key": key}),
+        format!("invalid {component} value {key}: {message}"),
+        serde_json::json!({"component": component, "key": key}),
     )
 }
 
@@ -1954,6 +1976,28 @@ mod tests {
         let error = resolve_recording_options(&recording, &config).unwrap_err();
         assert_eq!(error.code, ErrorCode::CaptureInitFailed);
         assert_eq!(error.data["component"], "config");
+        assert_eq!(error.data["key"], "effects.click_color_left");
+    }
+
+    #[test]
+    fn malformed_config_duration_has_config_error_envelope() {
+        let recording = parsed_recording(&["airec", "record"]);
+        let config: crate::config::AppConfig =
+            toml::from_str("[defaults]\nmax_duration = 'forever'\n").unwrap();
+        let error = resolve_recording_options(&recording, &config).unwrap_err();
+        assert_eq!(error.code, ErrorCode::CaptureInitFailed);
+        assert_eq!(error.data["component"], "config");
+        assert_eq!(error.data["key"], "defaults.max_duration");
+        assert_eq!(error.data["value"], "forever");
+    }
+
+    #[test]
+    fn malformed_cli_color_is_attributed_to_cli() {
+        let recording = parsed_recording(&["airec", "record", "--click-color-left", "yellow"]);
+        let error = resolve_recording_options(&recording, &crate::config::AppConfig::default())
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::CaptureInitFailed);
+        assert_eq!(error.data["component"], "cli");
         assert_eq!(error.data["key"], "effects.click_color_left");
     }
 }
