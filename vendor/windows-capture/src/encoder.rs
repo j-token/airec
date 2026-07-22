@@ -876,7 +876,9 @@ impl VideoEncoder {
         let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
         media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
         let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
-        media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
+        if !is_audio_disabled {
+            media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
+        }
         let (container_encoding_properties, hardware_acceleration) = container_settings.build()?;
         media_encoding_profile.SetContainer(&container_encoding_properties)?;
 
@@ -905,8 +907,11 @@ impl VideoEncoder {
         let audio_bps = audio_desc_props.BitsPerSample()?;
         let audio_block_align = (audio_bps / 8) * audio_ch;
 
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
+        let media_stream_source = if is_audio_disabled {
+            MediaStreamSource::CreateFromDescriptor(&video_stream_descriptor)?
+        } else {
+            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?
+        };
         // Keep a modest buffer (30ms)
         media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
 
@@ -1026,7 +1031,9 @@ impl VideoEncoder {
         let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
         media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
         let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
-        media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
+        if !is_audio_disabled {
+            media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
+        }
         let (container_encoding_properties, hardware_acceleration) = container_settings.build()?;
         media_encoding_profile.SetContainer(&container_encoding_properties)?;
 
@@ -1054,8 +1061,11 @@ impl VideoEncoder {
         let audio_bps = audio_desc_props.BitsPerSample()?;
         let audio_block_align = (audio_bps / 8) * audio_ch;
 
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
+        let media_stream_source = if is_audio_disabled {
+            MediaStreamSource::CreateFromDescriptor(&video_stream_descriptor)?
+        } else {
+            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?
+        };
         // CHANGED: use 30ms buffer (was 0)
         media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
 
