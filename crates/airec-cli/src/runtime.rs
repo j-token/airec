@@ -540,7 +540,8 @@ fn run_live(
         discard_prepared(prepared, pipelines);
         return Err(startup_abort_error(&startup_failures));
     }
-    for (target, encoder) in prepared.drain(..) {
+    prepared.reverse();
+    while let Some((target, encoder)) = prepared.pop() {
         match create_pipeline(
             &backend,
             &target,
