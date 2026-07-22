@@ -132,6 +132,8 @@ Errors are structured, and the exit code matches the code:
 | `NO_ACTIVE_SESSION`, `SESSION_AMBIGUOUS` | 4 |
 | `OUTPUT_IO_ERROR` | 5 |
 | `PARTIAL_FAILURE`, `ABORTED_ON_FAILURE` | 6 |
+| `PERMISSION_DENIED` | 7 |
+| `TARGET_LOST` | 8 |
 
 `AMBIGUOUS_TARGET` returns the candidate windows in `data`, so an agent can narrow the query on its own instead of guessing.
 

@@ -17,6 +17,7 @@ pub enum ErrorCode {
     PartialFailure,
     AbortedOnFailure,
     PermissionDenied,
+    TargetLost,
 }
 
 impl ErrorCode {
@@ -29,6 +30,7 @@ impl ErrorCode {
             Self::OutputIoError => 5,
             Self::PartialFailure | Self::AbortedOnFailure => 6,
             Self::PermissionDenied => 7,
+            Self::TargetLost => 8,
         }
     }
 }
@@ -75,6 +77,7 @@ mod tests {
             (ErrorCode::PartialFailure, 6),
             (ErrorCode::AbortedOnFailure, 6),
             (ErrorCode::PermissionDenied, 7),
+            (ErrorCode::TargetLost, 8),
         ];
         for (code, expected) in cases {
             assert_eq!(code.exit_code(), expected);
@@ -86,6 +89,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::FirstFrameTimeout).unwrap(),
             "\"FIRST_FRAME_TIMEOUT\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::TargetLost).unwrap(),
+            "\"TARGET_LOST\""
         );
     }
 }
