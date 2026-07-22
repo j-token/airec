@@ -74,7 +74,7 @@ airec loads at most one config: `airec.toml` in the current directory, otherwise
 
 ## D-018 — GIF conversion and WebM deferral
 
-`airec convert` decodes the recorded MP4 through Windows Media Foundation and writes GIF89a internally, with no process execution, runtime download, or external codec. It samples at the requested FPS, preserves aspect ratio under the requested maximum width, writes a sibling temporary file, and only renames after successful finalization. Existing outputs are never overwritten. Decode/format failures map to `CAPTURE_INIT_FAILED`; destination I/O maps to `OUTPUT_IO_ERROR`. WebM is deferred because Windows does not provide a consistently available built-in WebM encoder and adding or requiring a codec/ffmpeg stack would violate the offline and no-native-install constraints.
+`airec convert` decodes the recorded MP4 through Windows Media Foundation and writes GIF89a internally, with no process execution, runtime download, or external codec. The CLI defaults to 10 FPS and a 960 px maximum width, samples at the requested FPS, preserves aspect ratio without upscaling, writes a sibling temporary file, and only renames after successful finalization. Existing outputs are never overwritten. Decode/format failures map to `CAPTURE_INIT_FAILED`; destination I/O maps to `OUTPUT_IO_ERROR`. WebM is deferred because Windows does not provide a consistently available built-in WebM encoder and adding or requiring a codec/ffmpeg stack would violate the offline and no-native-install constraints.
 
 ## D-019 — Window geometry and close notification
 
