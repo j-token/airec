@@ -564,6 +564,7 @@ click_color_right = "#00A2FF"
 | `PARTIAL_FAILURE` | 다중 대상 중 일부 실패, 나머지는 저장됨 (`--on-failure continue`) | 6 |
 | `ABORTED_ON_FAILURE` | 대상 실패로 전체 세션 중단 (`--on-failure abort`), 원인 대상 포함 | 6 |
 | `PERMISSION_DENIED` | (v0.3) OS 화면 기록 권한 없음 | 7 |
+| `TARGET_LOST` | 첫 프레임 이후 대상 창이 사라졌지만 인코더 finalize가 성공함 | 8 |
 
 원칙: 부분 실패(`PARTIAL_FAILURE`)는 성공한 파일 목록과 실패한 대상·사유를 모두 `data`에 담는다.
 

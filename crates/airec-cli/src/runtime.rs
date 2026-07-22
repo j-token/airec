@@ -708,7 +708,14 @@ fn aggregate_startup_failures(
     if startup_failures.is_empty() {
         return None;
     }
-    let saved: Vec<_> = outcome
+    let has_saved = outcome
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::Saved { .. }));
+    if !has_saved {
+        return None;
+    }
+    let successes: Vec<_> = outcome
         .events
         .iter()
         .filter_map(|event| match event {
@@ -723,9 +730,6 @@ fn aggregate_startup_failures(
             _ => None,
         })
         .collect();
-    if saved.is_empty() {
-        return None;
-    }
     let mut failed: Vec<_> = startup_failures
         .iter()
         .map(|(target, error)| {
@@ -749,8 +753,8 @@ fn aggregate_startup_failures(
     }
     Some(AirecError::new(
         ErrorCode::PartialFailure,
-        "one or more targets failed while remaining targets were saved",
-        serde_json::json!({"successes": saved, "failures": failed}),
+        "one or more targets failed after at least one recording finalized",
+        serde_json::json!({"successes": successes, "failures": failed}),
     ))
 }
 
@@ -1793,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_failure_is_not_partial_success_when_no_pipeline_saved_normally() {
+    fn startup_failure_and_finalized_target_loss_are_partial_failure() {
         let startup = vec![(
             "monitor-2".into(),
             AirecError::new(
@@ -1812,6 +1816,40 @@ mod tests {
                 duration_ms: 1,
                 frames: 1,
                 size_bytes: 1,
+            }],
+            exit_code: 8,
+            error: Some(AirecError::new(
+                ErrorCode::TargetLost,
+                "runtime",
+                serde_json::json!({"target": "lost.mp4"}),
+            )),
+        };
+        let aggregate = aggregate_startup_failures(&startup, &outcome).unwrap();
+        assert_eq!(aggregate.code, ErrorCode::PartialFailure);
+        assert_eq!(aggregate.data["successes"].as_array().unwrap().len(), 0);
+        assert_eq!(aggregate.data["failures"].as_array().unwrap().len(), 2);
+        assert_eq!(aggregate.data["failures"][1]["code"], "TARGET_LOST");
+    }
+
+    #[test]
+    fn startup_failure_is_not_aggregated_when_nothing_was_saved() {
+        let startup = vec![(
+            "monitor-2".into(),
+            AirecError::new(
+                ErrorCode::CaptureInitFailed,
+                "startup",
+                serde_json::json!({}),
+            ),
+        )];
+        let outcome = SessionOutcome {
+            events: vec![Event::Error {
+                ts: Timestamp::now(),
+                session: "test".into(),
+                target: Some("lost.mp4".into()),
+                code: ErrorCode::CaptureInitFailed,
+                message: "runtime".into(),
+                data: serde_json::json!({}),
+                stop_reason: Some(StopReason::Error),
             }],
             exit_code: 3,
             error: Some(AirecError::new(

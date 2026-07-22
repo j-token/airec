@@ -48,7 +48,11 @@ pub struct SessionOutcome {
 enum PipelineMessage {
     FirstFrame(TargetSummary),
     Event(Event),
-    Failure(FailureRecord, StopReason),
+    Failure {
+        failure: FailureRecord,
+        stop_reason: StopReason,
+        finalized: bool,
+    },
     Complete(SuccessRecord),
 }
 
@@ -96,6 +100,7 @@ pub fn run_session(
     let mut started_targets = Vec::new();
     let mut successes = Vec::new();
     let mut failures = Vec::new();
+    let mut finalized_failures = 0;
     let mut failure_reasons = Vec::new();
     let mut completed = 0;
     let mut started_emitted = false;
@@ -115,9 +120,16 @@ pub fn run_session(
                 emit(&event);
                 events.push(event);
             }
-            PipelineMessage::Failure(failure, stop_reason) => {
+            PipelineMessage::Failure {
+                failure,
+                stop_reason,
+                finalized,
+            } => {
                 if startup_targets.insert(failure.target.clone()) {
                     startup_resolved += 1;
+                }
+                if finalized {
+                    finalized_failures += 1;
                 }
                 failures.push(failure);
                 failure_reasons.push(stop_reason);
@@ -161,7 +173,8 @@ pub fn run_session(
     let error = if failures.is_empty() {
         None
     } else if successes.is_empty()
-        && (target_count == 1 || options.failure_policy == FailurePolicy::Continue)
+        && (target_count == 1
+            || (options.failure_policy == FailurePolicy::Continue && finalized_failures == 0))
     {
         let failure = &failures[0];
         Some(AirecError::new(
@@ -313,9 +326,6 @@ fn run_pipeline(
         } else {
             None
         };
-        if let Some(reason) = read_stop(&options.stop).or(automatic_reason) {
-            break reason;
-        }
         if !pipeline.source.is_target_alive() {
             let event = Event::TargetLost {
                 ts: Timestamp::now(),
@@ -326,6 +336,9 @@ fn run_pipeline(
             };
             let _ = sender.send(PipelineMessage::Event(event));
             break StopReason::TargetLost;
+        }
+        if let Some(reason) = read_stop(&options.stop).or(automatic_reason) {
+            break reason;
         }
 
         next_frame_at += frame_interval;
@@ -420,19 +433,20 @@ fn run_pipeline(
             file: pipeline.output.to_string_lossy().into_owned(),
         }));
     } else {
-        let code = if stop_reason == StopReason::AbortedOnFailure {
-            ErrorCode::AbortedOnFailure
-        } else {
-            ErrorCode::CaptureInitFailed
+        let code = match stop_reason {
+            StopReason::AbortedOnFailure => ErrorCode::AbortedOnFailure,
+            StopReason::TargetLost => ErrorCode::TargetLost,
+            _ => ErrorCode::CaptureInitFailed,
         };
-        let _ = sender.send(PipelineMessage::Failure(
-            FailureRecord {
+        let _ = sender.send(PipelineMessage::Failure {
+            failure: FailureRecord {
                 target: pipeline.target,
                 code,
                 message: format!("pipeline ended with {stop_reason:?}"),
             },
             stop_reason,
-        ));
+            finalized: true,
+        });
     }
 }
 
@@ -479,14 +493,15 @@ fn pipeline_failure(
         &error,
         Some(stop_reason),
     )));
-    let _ = sender.send(PipelineMessage::Failure(
-        FailureRecord {
+    let _ = sender.send(PipelineMessage::Failure {
+        failure: FailureRecord {
             target: pipeline.target.clone(),
             code,
             message: message.into(),
         },
         stop_reason,
-    ));
+        finalized: false,
+    });
 }
 
 fn error_event(
@@ -631,6 +646,23 @@ mod tests {
         }
     }
 
+    struct FailsOnSecondProcess(u8);
+
+    impl FrameProcessor for FailsOnSecondProcess {
+        fn process(&mut self, frame: CaptureFrame) -> Result<CaptureFrame, AirecError> {
+            self.0 += 1;
+            if self.0 == 2 {
+                Err(AirecError::new(
+                    ErrorCode::CaptureInitFailed,
+                    "processor failed after start",
+                    json!({}),
+                ))
+            } else {
+                Ok(frame)
+            }
+        }
+    }
+
     fn frame() -> CaptureFrame {
         CaptureFrame {
             width: 2,
@@ -703,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn target_loss_is_unintended_and_nonzero() {
+    fn target_loss_after_first_frame_is_saved_then_reported_as_target_lost() {
         let outcome = run_session(
             vec![pipeline(MockSource {
                 frames: VecDeque::from([Some(frame())]),
@@ -712,21 +744,164 @@ mod tests {
             options(Duration::from_millis(50)),
             |_| {},
         );
-        assert_ne!(outcome.exit_code, 0);
-        assert!(outcome.events.iter().any(|event| matches!(
-            event,
-            Event::TargetLost {
-                stop_reason: StopReason::TargetLost,
-                ..
-            }
-        )));
+        assert_eq!(outcome.exit_code, 8);
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [
+                Event::Started { .. },
+                Event::TargetLost {
+                    stop_reason: StopReason::TargetLost,
+                    ..
+                },
+                Event::Saved {
+                    stop_reason: StopReason::TargetLost,
+                    ..
+                },
+                Event::Error {
+                    code: ErrorCode::TargetLost,
+                    stop_reason: Some(StopReason::TargetLost),
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn target_loss_before_first_frame_remains_capture_init_failed() {
+        let outcome = run_session(
+            vec![pipeline(MockSource {
+                frames: VecDeque::new(),
+                alive: false,
+            })],
+            options(Duration::from_millis(50)),
+            |_| {},
+        );
+        assert_eq!(outcome.exit_code, 3);
         assert!(outcome.events.iter().any(|event| matches!(
             event,
             Event::Error {
+                code: ErrorCode::CaptureInitFailed,
                 stop_reason: Some(StopReason::TargetLost),
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn multi_target_loss_aggregates_as_partial_failure() {
+        let mut second = pipeline(MockSource {
+            frames: VecDeque::from([Some(frame())]),
+            alive: false,
+        });
+        second.target = "second.mp4".into();
+        second.output = "second.mp4".into();
+        let outcome = run_session(
+            vec![
+                pipeline(MockSource {
+                    frames: VecDeque::from([Some(frame())]),
+                    alive: false,
+                }),
+                second,
+            ],
+            options(Duration::from_millis(50)),
+            |_| {},
+        );
+        assert_eq!(outcome.exit_code, 6);
+        assert!(matches!(
+            outcome.events.last(),
+            Some(Event::Error {
+                code: ErrorCode::PartialFailure,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn multi_target_startup_failures_keep_the_first_failure_code() {
+        let mut first = pipeline(MockSource {
+            frames: VecDeque::new(),
+            alive: true,
+        });
+        first.source = Box::new(FailingSource);
+        let mut second = pipeline(MockSource {
+            frames: VecDeque::new(),
+            alive: true,
+        });
+        second.target = "second.mp4".into();
+        second.output = "second.mp4".into();
+        second.source = Box::new(FailingSource);
+
+        let outcome = run_session(
+            vec![first, second],
+            options(Duration::from_millis(50)),
+            |_| {},
+        );
+
+        assert_eq!(outcome.exit_code, 3);
+        assert!(matches!(
+            outcome.events.last(),
+            Some(Event::Error {
+                code: ErrorCode::CaptureInitFailed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn multi_target_post_start_processor_failures_keep_the_first_failure_code() {
+        let mut first = pipeline(MockSource {
+            frames: VecDeque::from([Some(frame()), None]),
+            alive: true,
+        });
+        first.processor = Box::new(FailsOnSecondProcess(0));
+        let mut second = pipeline(MockSource {
+            frames: VecDeque::from([Some(frame()), None]),
+            alive: true,
+        });
+        second.target = "second.mp4".into();
+        second.output = "second.mp4".into();
+        second.processor = Box::new(FailsOnSecondProcess(0));
+
+        let outcome = run_session(
+            vec![first, second],
+            options(Duration::from_millis(50)),
+            |_| {},
+        );
+
+        assert_eq!(outcome.exit_code, 3);
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Saved { .. }))
+        );
+        assert!(matches!(
+            outcome.events.last(),
+            Some(Event::Error {
+                code: ErrorCode::CaptureInitFailed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn target_loss_wins_over_an_already_requested_stop() {
+        let run_options = options(Duration::from_millis(50));
+        *run_options.stop.lock().unwrap() = Some(StopReason::Requested);
+        let outcome = run_session(
+            vec![pipeline(MockSource {
+                frames: VecDeque::from([Some(frame())]),
+                alive: false,
+            })],
+            run_options,
+            |_| {},
+        );
+
+        assert_eq!(outcome.exit_code, 8);
+        assert!(matches!(
+            outcome.events.get(1),
+            Some(Event::TargetLost { .. })
+        ));
     }
 
     #[test]

@@ -132,6 +132,8 @@ airec record --monitor all --on-failure abort      # 전체를 finalize하고 �
 | `NO_ACTIVE_SESSION`, `SESSION_AMBIGUOUS` | 4 |
 | `OUTPUT_IO_ERROR` | 5 |
 | `PARTIAL_FAILURE`, `ABORTED_ON_FAILURE` | 6 |
+| `PERMISSION_DENIED` | 7 |
+| `TARGET_LOST` | 8 |
 
 `AMBIGUOUS_TARGET`은 후보 창 목록을 `data`에 함께 반환합니다. 에이전트가 추측하지 않고 스스로 질의를 좁힐 수 있습니다.
 

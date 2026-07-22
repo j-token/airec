@@ -12,7 +12,7 @@ Every event has `event`, `ts`, `session`, and `target`. `started` is session-wid
 
 ## D-003 — Window closure
 
-The public `stop_reason` is always `target_lost`, as defined by FR-007. A `target_lost` event contains `data.cause = "window_closed"`. With `continue`, other targets continue and final process status is `PARTIAL_FAILURE` (6). With `abort`, other targets finalize with `aborted_on_failure` and the process status is `ABORTED_ON_FAILURE` (6). For a single window, closure finalizes the file and exits with capture failure (3), because FR-007 classifies it as unintended.
+The public `stop_reason` is always `target_lost`, as defined by FR-007. A `target_lost` event contains `data.cause = "window_closed"` and takes priority over a concurrent requested or duration stop. With `continue`, other targets continue and final process status is `PARTIAL_FAILURE` (6). With `abort`, other targets finalize with `aborted_on_failure` and the process status is `ABORTED_ON_FAILURE` (6). For a single window, closure after the first frame finalizes the file and exits with `TARGET_LOST` (8); closure before the first frame remains `CAPTURE_INIT_FAILED` (3), because recording did not start.
 
 ## D-004 — First-frame timeout
 
