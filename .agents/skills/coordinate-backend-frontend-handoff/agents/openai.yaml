@@ -1,0 +1,4 @@
+interface:
+  display_name: "백엔드·프론트엔드 인계"
+  short_description: "기능 이슈를 백엔드·프론트엔드 작업과 PR로 안전하게 연결"
+  default_prompt: "Use $coordinate-backend-frontend-handoff to split this feature into backend and frontend sub-issues and prepare the backend PR handoff."
