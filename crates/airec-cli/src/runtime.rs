@@ -66,6 +66,7 @@ pub fn execute(cli: Cli) -> Result<i32, (AirecError, bool)> {
         Command::Status(args) => status(args),
         Command::Stop(args) => stop(args),
         Command::Doctor(args) => doctor(args),
+        Command::Convert(args) => convert(args),
         Command::Session(args) => session_child(&args.config).map_err(|error| (error, false)),
         #[cfg(debug_assertions)]
         Command::TestHold(args) => test_hold(args).map_err(|error| (error, false)),
@@ -351,6 +352,58 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
             args.json,
         ))
     }
+}
+
+fn convert(args: crate::args::ConvertArgs) -> Result<i32, (AirecError, bool)> {
+    let output = args
+        .out
+        .clone()
+        .unwrap_or_else(|| args.input.with_extension("gif"));
+    let result = airec_capture::convert_mp4_to_gif(
+        &args.input,
+        &output,
+        airec_capture::ConversionOptions {
+            fps: args.fps,
+            max_width: Some(args.width),
+        },
+    )
+    .map_err(|error| (error, args.json))?;
+    let size_bytes = std::fs::metadata(&result.output)
+        .map_err(|error| {
+            AirecError::new(
+                ErrorCode::OutputIoError,
+                format!("cannot inspect converted GIF: {error}"),
+                serde_json::json!({"component": "convert", "path": result.output}),
+            )
+        })
+        .map_err(|error| (error, args.json))?
+        .len();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "converted",
+                "ts": now_string(),
+                "input": args.input,
+                "file": result.output,
+                "width": result.width,
+                "height": result.height,
+                "frames": result.frames,
+                "duration_ms": result.duration_ms,
+                "size_bytes": size_bytes,
+            })
+        );
+    } else {
+        println!(
+            "Converted {} frames to {} ({}x{}, {} bytes)",
+            result.frames,
+            result.output.display(),
+            result.width,
+            result.height,
+            size_bytes
+        );
+    }
+    Ok(0)
 }
 
 fn session_child(config_path: &Path) -> Result<i32, AirecError> {

@@ -27,6 +27,8 @@ pub enum Command {
     Stop(StopArgs),
     /// Diagnose Windows Graphics Capture and encoder configuration.
     Doctor(JsonArgs),
+    /// Convert a recorded MP4 to an animated GIF.
+    Convert(ConvertArgs),
     #[command(name = "_session", hide = true)]
     Session(SessionArgs),
     #[cfg(debug_assertions)]
@@ -143,6 +145,23 @@ pub struct StopArgs {
 pub struct SessionArgs {
     #[arg(long)]
     pub config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ConvertArgs {
+    /// Source MP4 recorded by airec.
+    pub input: PathBuf,
+    /// Destination GIF. Defaults to the input path with a .gif extension.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Output frame rate.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=60))]
+    pub fps: u32,
+    /// Maximum output width; aspect ratio is preserved and smaller inputs are not enlarged.
+    #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u32).range(1..))]
+    pub width: u32,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(debug_assertions)]

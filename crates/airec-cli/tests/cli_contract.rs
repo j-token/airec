@@ -26,17 +26,42 @@ fn structured_no_session_error_has_prd_exit_and_one_json_line() {
 }
 
 #[test]
-fn help_exposes_every_v01_command() {
+fn help_exposes_every_public_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_airec"))
         .arg("--help")
         .output()
         .expect("run airec help");
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for command in ["list", "record", "start", "status", "stop", "doctor"] {
+    for command in [
+        "list", "record", "start", "status", "stop", "doctor", "convert",
+    ] {
         assert!(text.contains(command), "missing {command} from help");
     }
     assert!(!text.contains("_session"));
+}
+
+#[test]
+fn convert_failure_is_one_structured_json_line() {
+    let missing = std::env::temp_dir().join(format!(
+        "airec-missing-convert-input-{}.mp4",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    let output = Command::new(env!("CARGO_BIN_EXE_airec"))
+        .arg("convert")
+        .arg(&missing)
+        .arg("--json")
+        .output()
+        .expect("run airec convert");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["event"], "error");
+    assert_eq!(value["code"], "CAPTURE_INIT_FAILED");
+    assert_eq!(value["data"]["component"], "media_foundation_decoder");
 }
 
 #[test]

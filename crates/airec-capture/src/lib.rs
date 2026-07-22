@@ -1,7 +1,9 @@
 //! Windows Graphics Capture target enumeration and frame sources.
 
+mod convert;
 mod encoder;
 
+pub use convert::{ConversionOptions, ConversionResult, convert_mp4_to_gif};
 pub use encoder::{EncoderDiagnostics, WindowsEncoderFactory, diagnose_encoders};
 
 use std::path::{Path, PathBuf};
