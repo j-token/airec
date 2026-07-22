@@ -63,3 +63,23 @@ WGC frames and `WH_MOUSE_LL` events first use one monotonic epoch created before
 The workspace pins `windows-capture` 2.0.0 to `vendor/windows-capture` because the upstream 2.0.0 public encoder exposes the regular MPEG4 container but not Media Foundation's FMPEG4 fragmented container required by FR-006. The fork retains the upstream MIT `LICENCE` and changes `src/encoder.rs` to add the FMPEG4 container subtype, asynchronous transcoder error/readiness tracking, `wait_until_ready`, and `send_frame_buffer_at_timeline` so all target files preserve the shared session timeline; its stream-capture example is adjusted for the changed encoder surface.
 
 Upstream updates are tracked deliberately rather than accepted through an unconstrained Cargo upgrade. Before changing the pinned version, maintainers must compare the vendored tree with the matching upstream release, rebase this minimal fork, document any changed divergence here, retain upstream licensing, and rerun the encoder fallback/readiness tests plus live fragmented-MP4 forced-kill and multi-target timeline checks.
+
+## D-016 — v0.2 effect styles and drag recognition
+
+Effect configuration is a front-end-neutral `airec-core` value using RGB colors, output-frame pixels, and milliseconds. Hex colors use the exact `#RRGGBB` form. The v0.1 click defaults remain left `#FFD400`, right `#00A2FF`, size 34 px, and 500 ms. New defaults are drag `#FF4081`, 4 px, 650 ms and trail `#00E5FF`, 3 px, 250 ms. A drag starts after movement exceeds 4 px or a non-stationary press lasts 150 ms; every mouse move participates in recognition while published move events remain throttled to 100 ms. The timeline retains at most 65,536 events (over 100 minutes at the default move cadence), preventing unbounded session memory growth while retaining a complete default 30-minute sidecar window.
+
+## D-017 — Config selection, precedence, and errors
+
+airec loads at most one config: `airec.toml` in the current directory, otherwise `airec.toml` in `USERPROFILE`. A present but invalid current-directory file is an error and never falls through to home. Merge order is explicit CLI value, selected config value, then the v0.1 default. Unknown keys, invalid values, and TOML syntax errors map to the existing `CAPTURE_INIT_FAILED` code with `data.component = "config"`; file access failures map to `OUTPUT_IO_ERROR`. This keeps the v0.1 error-code set stable.
+
+## D-018 — GIF conversion and WebM deferral
+
+`airec convert` decodes the recorded MP4 through Windows Media Foundation and writes GIF89a internally, with no process execution, runtime download, or external codec. It samples at the requested FPS, preserves aspect ratio under the requested maximum width, writes a sibling temporary file, and only renames after successful finalization. Existing outputs are never overwritten. Decode/format failures map to `CAPTURE_INIT_FAILED`; destination I/O maps to `OUTPUT_IO_ERROR`. WebM is deferred because Windows does not provide a consistently available built-in WebM encoder and adding or requiring a codec/ffmpeg stack would violate the offline and no-native-install constraints.
+
+## D-019 — Window geometry and close notification
+
+Window client clipping and extended-frame mapping are refreshed while recording so move and resize changes follow the captured window. The most recent valid geometry may be reused across a transient query failure, but a confirmed WGC close or invalid HWND always wins and produces `target_lost`. The WGC close callback stores an atomic closed state before making a non-blocking channel notification, so a saturated frame queue cannot delay target-loss detection.
+
+## D-020 — Claude Code skill artifact
+
+The requested distributable artifact root is `skill/`, with `skill/SKILL.md` carrying valid skill frontmatter. Installers copy that directory as the `airec` skill into the Claude Code user or project skill location; the repository does not duplicate it under `.claude`, avoiding two independently drifting instructions. Automated validation checks the package structure; discovery and triggering remain a manual Claude Code integration check.
