@@ -13,7 +13,7 @@ resolver = "2"
 version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -22,6 +22,8 @@ clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 ctrlc = "3.4"
 interprocess = "2.2.3"
+libc = "0.2"
+openh264 = "0.9.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -48,6 +50,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-capture = { version = "2.0.0", path = "vendor/windows-capture" }
+x11rb = "0.14.0"
 
 [profile.release]
 lto = "thin"

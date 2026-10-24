@@ -52,7 +52,8 @@ pub fn load() -> Result<LoadedConfig, AirecError> {
             serde_json::json!({"component": "config"}),
         )
     })?;
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(home_variable).map(PathBuf::from);
     load_from(&current, home.as_deref())
 }
 

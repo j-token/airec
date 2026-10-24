@@ -141,15 +141,57 @@ jobs:
           $tag = "${{ steps.version.outputs.tag }}"
           $fence = [string][char]0x60 * 3
           $notes = @(
-            "Windows x86_64 build of airec $tag.",
+            "Windows x86_64 and Linux x86_64 (X11) builds of airec $tag.",
             "",
-            "Install:",
+            "Install on Windows:",
             "",
             ($fence + "powershell"),
             "irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex",
             $fence,
             "",
-            "SHA256 of the zip: ${{ steps.package.outputs.sha256 }}"
+            "Install on Linux:",
+            "",
+            ($fence + "sh"),
+            "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh",
+            $fence,
+            "",
+            "SHA256 of the Windows zip: ${{ steps.package.outputs.sha256 }}"
           )
           $notes -join "`n" | Set-Content dist\notes.md -Encoding utf8
           gh release create $tag --title $tag --notes-file dist\notes.md ${{ steps.package.outputs.asset }} "${{ steps.package.outputs.asset }}.sha256"
+
+  release-linux:
+    needs: [bump, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      LINUX_TARGET: x86_64-unknown-linux-gnu
+      TAG: ${{ needs.bump.outputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag || github.ref }}
+
+      # Built inside Ubuntu 22.04 so the binary links against the oldest glibc it supports.
+      - name: Build on Ubuntu 22.04
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates build-essential >/dev/null
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            cargo build --release --locked --target "'"$LINUX_TARGET"'" --bin airec
+            "target/'"$LINUX_TARGET"'/release/airec" --version
+          '
+
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="airec-$TAG-$LINUX_TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$LINUX_TARGET/release/airec" LICENSE NOTICE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          gh release upload "$TAG" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256"

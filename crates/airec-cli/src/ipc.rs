@@ -3,9 +3,17 @@ use std::io::{BufRead, BufReader, Write};
 use airec_core::{AirecError, ControlRequest, ControlResponse, ErrorCode};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
 
+#[cfg(windows)]
 #[must_use]
 pub fn pipe_display_name(session: &str) -> String {
     format!(r"\\.\pipe\airec-{session}")
+}
+
+/// `GenericNamespaced` names are abstract Unix sockets on Linux, conventionally shown with `@`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn pipe_display_name(session: &str) -> String {
+    format!("@airec-{session}")
 }
 
 fn pipe_name(session: &str) -> Result<interprocess::local_socket::Name<'static>, AirecError> {
@@ -95,9 +103,16 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn display_name_matches_prd() {
         assert_eq!(pipe_display_name("a1b2"), r"\\.\pipe\airec-a1b2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn display_name_shows_the_abstract_socket() {
+        assert_eq!(pipe_display_name("a1b2"), "@airec-a1b2");
     }
 
     #[test]

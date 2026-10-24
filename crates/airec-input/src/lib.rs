@@ -1,25 +1,27 @@
-//! Mouse-only low-level input collection. This crate intentionally has no keyboard APIs.
+//! Mouse-only global input collection. This crate intentionally has no keyboard APIs.
+
+#[cfg(windows)]
+mod windows_hook;
+#[cfg(target_os = "linux")]
+mod x11_listener;
+
+#[cfg(windows)]
+use windows_hook as platform;
+#[cfg(target_os = "linux")]
+use x11_listener as platform;
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use airec_core::{AirecError, ErrorCode, InputEvent, InputSource, MouseButton};
 pub use airec_core::{
     DEFAULT_DRAG_THRESHOLD_MS, DEFAULT_DRAG_THRESHOLD_PIXELS,
     DEFAULT_MAX_INPUT_HISTORY_EVENTS as DEFAULT_MAX_HISTORY_EVENTS, DEFAULT_MOVE_THROTTLE_MS,
     InputOptions as MouseHookOptions,
-};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, MSLLHOOKSTRUCT, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 #[derive(Default)]
@@ -36,9 +38,17 @@ struct PressedButton {
     t_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseAction {
+    Press(MouseButton),
+    Release(MouseButton),
+    Move,
+}
+
+/// Turns raw presses, releases, and moves into click, drag, and throttled move events.
 #[derive(Default)]
 struct HookState {
-    timeline: Option<std::sync::Arc<Mutex<EventTimeline>>>,
+    timeline: Option<Arc<Mutex<EventTimeline>>>,
     started_at: Option<Instant>,
     last_move_ms: u64,
     last_click: Option<(MouseButton, u64, i32, i32)>,
@@ -48,6 +58,69 @@ struct HookState {
 }
 
 impl HookState {
+    fn new(
+        timeline: Arc<Mutex<EventTimeline>>,
+        started_at: Instant,
+        options: MouseHookOptions,
+    ) -> Self {
+        Self {
+            timeline: Some(timeline),
+            started_at: Some(started_at),
+            options,
+            ..Self::default()
+        }
+    }
+
+    fn handle(&mut self, action: MouseAction, x: i32, y: i32, double_click_ms: u64) {
+        let (Some(timeline), Some(started_at)) = (self.timeline.clone(), self.started_at) else {
+            return;
+        };
+        let t_ms = started_at.elapsed().as_millis() as u64;
+        let max_history_events = self.options.max_history_events;
+        match action {
+            MouseAction::Press(button) => self.press(button, t_ms, x, y),
+            MouseAction::Release(button) => {
+                let was_drag = self.drag_active;
+                if was_drag {
+                    push_event(
+                        &timeline,
+                        InputEvent::DragEnd { t_ms, button, x, y },
+                        max_history_events,
+                    );
+                }
+                let double =
+                    self.last_click
+                        .is_some_and(|(last_button, last_ms, last_x, last_y)| {
+                            last_button == button
+                                && t_ms.saturating_sub(last_ms) <= double_click_ms
+                                && (x - last_x).abs() <= 4
+                                && (y - last_y).abs() <= 4
+                        });
+                self.last_click = Some((button, t_ms, x, y));
+                self.pressed = None;
+                self.drag_active = false;
+                if !was_drag {
+                    push_event(
+                        &timeline,
+                        InputEvent::Click {
+                            t_ms,
+                            button,
+                            x,
+                            y,
+                            double,
+                        },
+                        max_history_events,
+                    );
+                }
+            }
+            MouseAction::Move => {
+                for event in self.move_events(t_ms, x, y) {
+                    push_event(&timeline, event, max_history_events);
+                }
+            }
+        }
+    }
+
     fn press(&mut self, button: MouseButton, t_ms: u64, x: i32, y: i32) {
         self.pressed = Some(PressedButton { button, x, y, t_ms });
         self.drag_active = false;
@@ -83,87 +156,9 @@ impl HookState {
     }
 }
 
-static HOOK_STATE: OnceLock<Mutex<HookState>> = OnceLock::new();
-
-unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        let data = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if let Ok(mut state) = HOOK_STATE
-            .get_or_init(|| Mutex::new(HookState::default()))
-            .lock()
-            && let (Some(timeline), Some(started_at)) = (&state.timeline, state.started_at)
-        {
-            let timeline = timeline.clone();
-            let t_ms = started_at.elapsed().as_millis() as u64;
-            let (x, y) = (data.pt.x, data.pt.y);
-            let message = wparam.0 as u32;
-            match message {
-                WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
-                    let button = if message == WM_LBUTTONDOWN {
-                        MouseButton::Left
-                    } else {
-                        MouseButton::Right
-                    };
-                    state.press(button, t_ms, x, y);
-                }
-                WM_LBUTTONUP | WM_RBUTTONUP => {
-                    let button = if message == WM_LBUTTONUP {
-                        MouseButton::Left
-                    } else {
-                        MouseButton::Right
-                    };
-                    let was_drag = state.drag_active;
-                    if was_drag {
-                        push_event(
-                            &timeline,
-                            InputEvent::DragEnd { t_ms, button, x, y },
-                            state.options.max_history_events,
-                        );
-                    }
-                    let threshold = u64::from(unsafe { GetDoubleClickTime() });
-                    let double =
-                        state
-                            .last_click
-                            .is_some_and(|(last_button, last_ms, last_x, last_y)| {
-                                last_button == button
-                                    && t_ms.saturating_sub(last_ms) <= threshold
-                                    && (x - last_x).abs() <= 4
-                                    && (y - last_y).abs() <= 4
-                            });
-                    state.last_click = Some((button, t_ms, x, y));
-                    state.pressed = None;
-                    state.drag_active = false;
-                    if !was_drag {
-                        push_event(
-                            &timeline,
-                            InputEvent::Click {
-                                t_ms,
-                                button,
-                                x,
-                                y,
-                                double,
-                            },
-                            state.options.max_history_events,
-                        );
-                    }
-                }
-                WM_MOUSEMOVE => {
-                    let max_history_events = state.options.max_history_events;
-                    for event in state.move_events(t_ms, x, y) {
-                        push_event(&timeline, event, max_history_events);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
 pub struct MouseHook {
-    timeline: std::sync::Arc<Mutex<EventTimeline>>,
-    thread: Option<JoinHandle<Result<(), AirecError>>>,
-    thread_id: u32,
+    timeline: Arc<Mutex<EventTimeline>>,
+    _listener: platform::Listener,
 }
 
 impl MouseHook {
@@ -175,48 +170,12 @@ impl MouseHook {
         started_at: Instant,
         options: MouseHookOptions,
     ) -> Result<Self, AirecError> {
-        let timeline = std::sync::Arc::new(Mutex::new(EventTimeline::default()));
-        let hook_timeline = timeline.clone();
-        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-        let thread = std::thread::spawn(move || {
-            let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-            if let Ok(mut state) = HOOK_STATE
-                .get_or_init(|| Mutex::new(HookState::default()))
-                .lock()
-            {
-                state.timeline = Some(hook_timeline);
-                state.started_at = Some(started_at);
-                state.last_move_ms = 0;
-                state.last_click = None;
-                state.pressed = None;
-                state.drag_active = false;
-                state.options = options;
-            }
-            let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) }
-                .map_err(|error| {
-                    AirecError::new(
-                        ErrorCode::CaptureInitFailed,
-                        error.to_string(),
-                        serde_json::json!({"component": "mouse_hook"}),
-                    )
-                })?;
-            ready_sender.send(Ok(thread_id)).ok();
-            run_message_loop(hook);
-            Ok(())
-        });
-        let thread_id = ready_receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|error| {
-                AirecError::new(
-                    ErrorCode::CaptureInitFailed,
-                    error.to_string(),
-                    serde_json::json!({"component": "mouse_hook"}),
-                )
-            })??;
+        let timeline = Arc::new(Mutex::new(EventTimeline::default()));
+        let listener =
+            platform::Listener::start(HookState::new(timeline.clone(), started_at, options))?;
         Ok(Self {
             timeline,
-            thread: Some(thread),
-            thread_id,
+            _listener: listener,
         })
     }
 
@@ -234,42 +193,16 @@ impl MouseHook {
     }
 }
 
-fn run_message_loop(hook: HHOOK) {
-    let mut message = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-    unsafe {
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        let _ = UnhookWindowsHookEx(hook);
-    }
-    if let Ok(mut state) = HOOK_STATE
-        .get_or_init(|| Mutex::new(HookState::default()))
-        .lock()
-    {
-        state.timeline = None;
-        state.started_at = None;
-    }
-}
-
-impl Drop for MouseHook {
-    fn drop(&mut self) {
-        let _ = unsafe {
-            PostThreadMessageW(
-                self.thread_id,
-                WM_QUIT,
-                WPARAM::default(),
-                LPARAM::default(),
-            )
-        };
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
+fn hook_error(message: impl Into<String>) -> AirecError {
+    AirecError::new(
+        ErrorCode::CaptureInitFailed,
+        message,
+        serde_json::json!({"component": "mouse_hook"}),
+    )
 }
 
 pub struct MouseSubscription {
-    timeline: std::sync::Arc<Mutex<EventTimeline>>,
+    timeline: Arc<Mutex<EventTimeline>>,
     cursor: u64,
 }
 
@@ -399,6 +332,39 @@ mod tests {
     }
 
     #[test]
+    fn press_and_release_in_place_records_a_click_and_a_second_one_is_double() {
+        let timeline = Arc::new(Mutex::new(EventTimeline::default()));
+        let mut state = HookState::new(
+            timeline.clone(),
+            Instant::now(),
+            MouseHookOptions::default(),
+        );
+
+        for _ in 0..2 {
+            state.handle(MouseAction::Press(MouseButton::Left), 10, 20, 500);
+            state.handle(MouseAction::Release(MouseButton::Left), 10, 20, 500);
+        }
+
+        let events = MouseSubscription {
+            timeline,
+            cursor: 0,
+        }
+        .drain_until(u64::MAX);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InputEvent::Click {
+                    double: false,
+                    x: 10,
+                    y: 20,
+                    ..
+                },
+                InputEvent::Click { double: true, .. }
+            ]
+        ));
+    }
+
+    #[test]
     fn fast_drag_is_detected_even_when_move_is_throttled() {
         let mut state = HookState {
             options: MouseHookOptions {
@@ -454,7 +420,7 @@ mod tests {
 
     #[test]
     fn bounded_history_keeps_subscriptions_safe_and_ordered() {
-        let timeline = std::sync::Arc::new(Mutex::new(EventTimeline::default()));
+        let timeline = Arc::new(Mutex::new(EventTimeline::default()));
         for t_ms in 0..6 {
             push_event(&timeline, move_event(t_ms), 4);
         }

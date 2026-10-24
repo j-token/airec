@@ -2,14 +2,14 @@
 
 [한국어](README.ko.md)
 
-A Windows command-line screen recorder for AI agents that need to show their work.
+A command-line screen recorder for AI agents that need to show their work, on Windows and on Linux under X11.
 
 An agent finishes a computer-use task and you want to know whether it actually worked. Screenshots only show moments. airec records the whole session to MP4, so you can attach the file to a pull request and watch what happened instead of reinstalling the app and clicking through it yourself.
 
 ## What it does
 
 - Records a monitor, several monitors at once, or specific application windows, each to its own file
-- Captures a window even when other windows cover it, using Windows Graphics Capture
+- On Windows, captures a window even when other windows cover it, using Windows Graphics Capture
 - Burns click, drag, and pointer-trail effects into the frames so the mouse is visible during playback
 - Emits lifecycle events as JSONL on stdout, so a script can tell whether recording started, how it is going, and why it stopped
 - Converts a recording to GIF
@@ -19,6 +19,8 @@ It has no GUI, no audio capture, no network access, no upload feature, no keyboa
 > Recordings can contain passwords, tokens, and personal data. Review one before you share it. UAC secure-desktop and DRM-protected content are not bypassed and will appear black.
 
 ## Install
+
+### Windows
 
 Windows 10 version 2004 or later, or Windows 11, on x86_64.
 
@@ -41,19 +43,33 @@ Uninstalling removes the executable and the PATH entry, and leaves your recordin
 
 If piping a script into your shell is not something you want to do, take the zip from the [releases page](https://github.com/j-token/airec/releases), verify it against the `.sha256` next to it, and put `airec.exe` anywhere on your PATH.
 
-Building from source needs Rust 1.85 or later:
+### Linux
+
+Ubuntu 22.04 LTS or later, or another x86_64 distribution with glibc 2.35 or later, running an X11 session. Wayland sessions are not supported; see [Status and limits](#status-and-limits).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
+```
+
+That takes the latest release, checks its SHA256, and installs `airec` to `~/.local/bin`. No root, no system packages: the X11 client and the OpenH264 encoder are compiled into the executable. Set `AIREC_VERSION=v0.3.0` to pin a release, `AIREC_INSTALL_DIR` to install elsewhere, or pass `--uninstall` with `curl ... | sh -s -- --uninstall` to remove it.
+
+On a headless server or in a cloud sandbox, give airec a virtual display such as `Xvfb :99 -screen 0 1920x1080x24` and set `DISPLAY=:99`.
+
+### From source
+
+Building from source needs Rust 1.89 or later, and a C compiler on Linux for the bundled OpenH264:
 
 ```powershell
 cargo build --release
 ```
 
-The executable lands at `target\release\airec.exe`. Confirm capture and encoding work on your machine before you depend on them:
+The executable lands at `target\release\airec.exe`, or `target/release/airec` on Linux. Confirm capture and encoding work on your machine before you depend on them:
 
 ```powershell
 airec doctor --json
 ```
 
-`doctor` reports whether Windows Graphics Capture is available, which encoder will be selected, and whether hardware encoding succeeded. On a GPU-less VM it falls back to software encoding and says so.
+On Windows, `doctor` reports whether Windows Graphics Capture is available, which encoder will be selected, and whether hardware encoding succeeded. On a GPU-less VM it falls back to software encoding and says so. On Linux it reports the `DISPLAY` it connected to, whether the session is Wayland, whether XFixes can supply the cursor image, and the monitors it found; encoding is always the bundled OpenH264 software encoder.
 
 ## Recording
 
@@ -76,7 +92,7 @@ Record every monitor to its own file:
 airec record --monitor all --duration 30s --out-dir .\rec
 ```
 
-Record two windows, each to its own file. A window is matched by title substring, by HWND, or by process name:
+Record two windows, each to its own file. A window is matched by title substring, by HWND (the X11 window id on Linux), or by process name:
 
 ```powershell
 airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-dir .\rec
@@ -145,6 +161,10 @@ The skill is instructions, not the recorder. Whichever way you install the skill
 irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 ```
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
+```
+
 To install it as a Claude Code plugin, run the following in a shell. Inside a Claude Code session, use `/plugin` in place of `claude plugin`.
 
 ```powershell
@@ -191,7 +211,7 @@ airec record --drag-color "#FF00AA" --drag-size 6 --trail-duration-ms 400 --dura
 airec convert demo.mp4 --fps 10 --width 960
 ```
 
-Decoding and GIF writing happen in-process through Media Foundation. Nothing is downloaded and no ffmpeg install is required. Defaults are 10 fps and a maximum width of 960 px, aspect ratio preserved, and smaller inputs are not enlarged. An existing output is never overwritten.
+Decoding and GIF writing happen in-process, through Media Foundation on Windows and the bundled OpenH264 decoder on Linux. Nothing is downloaded and no ffmpeg install is required. Defaults are 10 fps and a maximum width of 960 px, aspect ratio preserved, and smaller inputs are not enlarged. An existing output is never overwritten.
 
 Frames after the first are written as differences against the previous frame, so a recording where little moves stays much smaller than one where the whole screen changes. A 3-second 1080p desktop recording measured 533 KB as MP4 and 501 KB as GIF at 960 px wide. Content that changes on every frame, such as scrolling or video playback, gets little benefit from that and can still produce a GIF several times the size of the source.
 
@@ -201,7 +221,7 @@ WebM is not supported. Windows has no consistently available built-in WebM encod
 
 ## Configuration
 
-Defaults can live in `airec.toml`, read from the current directory, or from `%USERPROFILE%` if there is none:
+Defaults can live in `airec.toml`, read from the current directory, or from `%USERPROFILE%` (`$HOME` on Linux) if there is none:
 
 ```toml
 [defaults]
@@ -218,7 +238,11 @@ An explicit flag beats the config file, which beats the built-in default. A conf
 
 ## Status and limits
 
-Windows only for now. macOS through ScreenCaptureKit and Linux through xdg-desktop-portal are planned for v0.3, each with a first-run permission step. On Wayland the compositor requires the user to pick the capture target in a portal dialog, so fully unattended window selection will not be possible there; the plan is to store the restore token so only the first run needs a human.
+Linux support covers X11 sessions only. Ubuntu 22.04 and 24.04 desktops start in Wayland by default; pick "Ubuntu on Xorg" on the login screen to use airec there. Under Wayland, screen capture goes through an xdg-desktop-portal dialog where a person has to pick the target, and global mouse input is not available to applications at all, so an agent cannot record unattended. `doctor` reports `wayland_session: true` in that case. airec may still connect through XWayland, but XWayland only holds X11 applications, so native Wayland windows and the desktop are missing from what it records.
+
+On Linux, window capture reads the window's pixels from the X server. Without a compositing window manager, the covered part of a window shows whatever is on top of it, unlike Windows Graphics Capture. Monitor capture is unaffected.
+
+macOS through ScreenCaptureKit is planned, with a first-run permission step.
 
 Also not present: audio, region capture, keyboard display, streaming, editing, and automatic upload. Upload stays out on purpose, since `gh` and similar tools already do it and airec has no business touching the network.
 

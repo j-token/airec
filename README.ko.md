@@ -2,14 +2,14 @@
 
 [English](README.md)
 
-AI 에이전트가 자기 작업을 증거로 남기기 위한 윈도우 CLI 화면 녹화기입니다.
+AI 에이전트가 자기 작업을 증거로 남기기 위한 CLI 화면 녹화기입니다. 윈도우와 X11 기반 리눅스에서 동작합니다.
 
 에이전트가 컴퓨터를 조작해 작업을 끝냈을 때, 그게 실제로 잘 된 건지 확인해야 합니다. 스크린샷은 순간만 보여줍니다. airec는 작업 과정 전체를 MP4로 녹화하므로, 프로그램을 다시 설치하고 직접 눌러보는 대신 PR에 영상을 붙여놓고 보면 됩니다.
 
 ## 기능
 
 - 모니터 하나, 여러 모니터 동시, 또는 특정 앱 창을 각각 별도 파일로 녹화합니다
-- Windows Graphics Capture를 쓰기 때문에 대상 창이 다른 창에 가려져 있어도 그 창의 내용이 녹화됩니다
+- 윈도우에서는 Windows Graphics Capture를 쓰기 때문에 대상 창이 다른 창에 가려져 있어도 그 창의 내용이 녹화됩니다
 - 클릭, 드래그, 포인터 이동 효과를 프레임에 직접 합성해서 재생할 때 마우스가 보입니다
 - 녹화 상태를 stdout에 JSONL로 출력하므로, 스크립트가 녹화 시작 여부와 진행 상황, 종료 사유를 판단할 수 있습니다
 - 녹화본을 GIF로 변환합니다
@@ -19,6 +19,8 @@ GUI, 오디오 녹음, 네트워크 접근, 업로드 기능, 키보드 후킹, 
 > 녹화본에는 비밀번호, 토큰, 개인정보가 담길 수 있습니다. 공유하기 전에 한 번 확인하십시오. UAC 보안 데스크톱과 DRM 보호 콘텐츠는 우회하지 않으며 검은 화면으로 기록됩니다.
 
 ## 설치
+
+### 윈도우
 
 Windows 10 버전 2004 이상 또는 Windows 11, x86_64에서 동작합니다.
 
@@ -41,19 +43,33 @@ $s = [scriptblock]::Create((irm https://raw.githubusercontent.com/j-token/airec/
 
 스크립트를 셸에 바로 흘려 넣는 게 꺼려지면 [릴리즈 페이지](https://github.com/j-token/airec/releases)에서 zip을 받아 옆에 있는 `.sha256`으로 검증한 뒤 `airec.exe`를 PATH 아무 곳에나 두면 됩니다.
 
-소스에서 빌드하려면 Rust 1.85 이상이 필요합니다.
+### 리눅스
+
+Ubuntu 22.04 LTS 이상, 또는 glibc 2.35 이상인 x86_64 배포판의 X11 세션에서 동작합니다. Wayland 세션은 지원하지 않습니다. 자세한 내용은 [현재 상태와 한계](#현재-상태와-한계)를 보십시오.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
+```
+
+최신 릴리즈를 받아 SHA256을 확인하고 `airec`를 `~/.local/bin`에 설치합니다. root 권한도 시스템 패키지도 필요 없습니다. X11 클라이언트와 OpenH264 인코더가 실행 파일 안에 들어 있습니다. `AIREC_VERSION=v0.3.0`으로 버전을 고정하고, `AIREC_INSTALL_DIR`로 설치 경로를 바꾸고, `curl ... | sh -s -- --uninstall`로 지웁니다.
+
+모니터가 없는 서버나 클라우드 샌드박스에서는 `Xvfb :99 -screen 0 1920x1080x24` 같은 가상 디스플레이를 띄우고 `DISPLAY=:99`를 지정하면 됩니다.
+
+### 소스에서 빌드
+
+소스에서 빌드하려면 Rust 1.89 이상이 필요하고, 리눅스에서는 내장 OpenH264를 컴파일할 C 컴파일러도 필요합니다.
 
 ```powershell
 cargo build --release
 ```
 
-실행 파일은 `target\release\airec.exe`에 생성됩니다. 사용하기 전에 이 컴퓨터에서 캡처와 인코딩이 되는지 먼저 확인하십시오.
+실행 파일은 `target\release\airec.exe`(리눅스는 `target/release/airec`)에 생성됩니다. 사용하기 전에 이 컴퓨터에서 캡처와 인코딩이 되는지 먼저 확인하십시오.
 
 ```powershell
 airec doctor --json
 ```
 
-`doctor`는 Windows Graphics Capture 지원 여부, 선택될 인코더, 하드웨어 인코딩 성공 여부를 보고합니다. GPU가 없는 VM에서는 소프트웨어 인코딩으로 넘어가고 그 사실을 알려줍니다.
+윈도우에서 `doctor`는 Windows Graphics Capture 지원 여부, 선택될 인코더, 하드웨어 인코딩 성공 여부를 보고합니다. GPU가 없는 VM에서는 소프트웨어 인코딩으로 넘어가고 그 사실을 알려줍니다. 리눅스에서는 연결한 `DISPLAY`, Wayland 세션 여부, XFixes로 커서 이미지를 받을 수 있는지, 찾은 모니터 목록을 보고합니다. 인코딩은 항상 내장 OpenH264 소프트웨어 인코더로 합니다.
 
 ## 녹화
 
@@ -76,7 +92,7 @@ airec record --duration 30s --out demo.mp4
 airec record --monitor all --duration 30s --out-dir .\rec
 ```
 
-창 두 개를 각각 파일로 녹화합니다. 창은 제목 일부, HWND, 프로세스명 중 하나로 지정합니다.
+창 두 개를 각각 파일로 녹화합니다. 창은 제목 일부, HWND(리눅스에서는 X11 창 id), 프로세스명 중 하나로 지정합니다.
 
 ```powershell
 airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-dir .\rec
@@ -145,6 +161,10 @@ airec record --monitor all --on-failure abort      # 전체를 finalize하고 �
 irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 ```
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
+```
+
 Claude Code 플러그인으로 설치하려면 셸에서 다음을 실행합니다. Claude Code 세션 안에서는 `claude` 대신 `/plugin`으로 같은 명령을 씁니다.
 
 ```powershell
@@ -191,7 +211,7 @@ airec record --drag-color "#FF00AA" --drag-size 6 --trail-duration-ms 400 --dura
 airec convert demo.mp4 --fps 10 --width 960
 ```
 
-디코딩과 GIF 작성 모두 Media Foundation을 통해 프로세스 내부에서 처리합니다. 다운로드하는 것도 없고 ffmpeg 설치도 필요 없습니다. 기본값은 10 fps에 최대 너비 960 px이며, 비율을 유지하고 원본이 더 작으면 확대하지 않습니다. 이미 있는 출력 파일은 덮어쓰지 않습니다.
+디코딩과 GIF 작성 모두 프로세스 내부에서 처리합니다. 윈도우에서는 Media Foundation으로, 리눅스에서는 내장 OpenH264 디코더로 디코딩합니다. 다운로드하는 것도 없고 ffmpeg 설치도 필요 없습니다. 기본값은 10 fps에 최대 너비 960 px이며, 비율을 유지하고 원본이 더 작으면 확대하지 않습니다. 이미 있는 출력 파일은 덮어쓰지 않습니다.
 
 첫 프레임 이후는 이전 프레임과의 차분으로 기록하므로, 화면이 거의 안 바뀌는 녹화본은 훨씬 작게 나오고 전체가 계속 바뀌는 녹화본은 그렇지 않습니다. 3초짜리 1080p 데스크톱 녹화본으로 재보니 MP4가 533 KB, 너비 960 px GIF가 501 KB였습니다. 스크롤이나 영상 재생처럼 매 프레임이 통째로 바뀌는 콘텐츠는 차분에서 얻을 게 없어서 원본보다 몇 배 커질 수 있습니다.
 
@@ -201,7 +221,7 @@ WebM은 지원하지 않습니다. 윈도우에 항상 쓸 수 있는 내장 Web
 
 ## 설정
 
-기본값을 `airec.toml`에 둘 수 있습니다. 현재 디렉터리에서 찾고, 없으면 `%USERPROFILE%`에서 찾습니다.
+기본값을 `airec.toml`에 둘 수 있습니다. 현재 디렉터리에서 찾고, 없으면 `%USERPROFILE%`(리눅스는 `$HOME`)에서 찾습니다.
 
 ```toml
 [defaults]
@@ -218,7 +238,11 @@ click_color_right = "#00A2FF"
 
 ## 현재 상태와 한계
 
-지금은 윈도우만 지원합니다. macOS는 ScreenCaptureKit으로, 리눅스는 xdg-desktop-portal로 v0.3에서 지원할 계획이고, 둘 다 최초 실행 시 권한을 받는 과정이 필요합니다. Wayland에서는 컴포지터가 캡처 대상을 포털 대화상자에서 사용자가 직접 고르도록 강제하므로 창 지정을 완전 무인으로 하는 것은 불가능합니다. restore token을 저장해서 최초 1회만 사람이 개입하도록 만드는 방향으로 잡고 있습니다.
+리눅스는 X11 세션만 지원합니다. Ubuntu 22.04와 24.04 데스크톱은 기본으로 Wayland로 시작하므로, 로그인 화면에서 "Ubuntu on Xorg"를 골라야 airec를 쓸 수 있습니다. Wayland에서는 화면 캡처가 xdg-desktop-portal 대화상자를 거쳐 사람이 대상을 직접 골라야 하고, 전역 마우스 입력은 애플리케이션에 아예 제공되지 않습니다. 그래서 에이전트가 무인으로 녹화할 수 없습니다. 이 경우 `doctor`가 `wayland_session: true`를 보고합니다. XWayland를 통해 연결될 수는 있지만 XWayland에는 X11 애플리케이션만 있어서, 네이티브 Wayland 창과 데스크톱은 녹화본에 나오지 않습니다.
+
+리눅스의 창 캡처는 X 서버에서 그 창의 픽셀을 읽습니다. 컴포지팅 창 관리자가 없으면 Windows Graphics Capture와 달리 창의 가려진 부분에는 위에 덮인 창이 그대로 찍힙니다. 모니터 캡처는 영향이 없습니다.
+
+macOS는 ScreenCaptureKit으로 지원할 계획이고, 최초 실행 시 권한을 받는 과정이 필요합니다.
 
 오디오, 영역 지정 녹화, 키보드 입력 표시, 스트리밍, 편집, 자동 업로드도 없습니다. 업로드는 일부러 뺐습니다. `gh` 같은 도구가 이미 하는 일이고 airec가 네트워크를 건드릴 이유가 없습니다.
 

@@ -1,6 +1,6 @@
 ---
 name: airec
-description: Record Windows screen evidence with the airec CLI, inspect JSONL session state, stop recordings safely, and convert recorded MP4 evidence to GIF. Use when an agent must capture verifiable evidence of its own Windows computer-use work.
+description: Record Windows or Linux (X11) screen evidence with the airec CLI, inspect JSONL session state, stop recordings safely, and convert recorded MP4 evidence to GIF. Use when an agent must capture verifiable evidence of its own computer-use work on Windows or on a Linux X11 desktop.
 ---
 
 # airec evidence recording
@@ -9,7 +9,7 @@ Use `airec` only for explicit evidence tasks. It records pixels and mouse activi
 
 ## Install the CLI
 
-This skill is instructions only; `airec.exe` is a separate download. If `airec --version` fails, install it before doing anything else:
+This skill is instructions only; the `airec` executable is a separate download. If `airec --version` fails, install it before doing anything else. On Windows:
 
 ```powershell
 irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
@@ -17,7 +17,17 @@ irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
 
 The script verifies the release checksum, installs to `%LOCALAPPDATA%\airec\bin`, and adds that directory to the user PATH. It needs no administrator rights and no Rust toolchain. PATH changes do not reach an already-running shell, so in the current session invoke the executable by its full path, `$env:LOCALAPPDATA\airec\bin\airec.exe`, until a new shell is started.
 
-Requires Windows 10 version 2004 or later on x86_64. Do not install by building from source unless the user asks for it; a release build takes minutes.
+Requires Windows 10 version 2004 or later on x86_64.
+
+On Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
+```
+
+The script verifies the release checksum and installs to `~/.local/bin/airec`; call it by that full path if `~/.local/bin` is not on PATH. Linux needs x86_64 with glibc 2.35 or later (Ubuntu 22.04 or later) and an X11 display in `DISPLAY`. If `doctor` reports `wayland_session: true`, tell the user that airec cannot record a Wayland desktop unattended instead of recording anyway. On a machine without a display, start `Xvfb :99 -screen 0 1920x1080x24` and set `DISPLAY=:99`.
+
+Do not install by building from source unless the user asks for it; a release build takes minutes.
 
 ## Choose the failure policy
 
@@ -26,9 +36,9 @@ Requires Windows 10 version 2004 or later on x86_64. Do not install by building 
 
 ## Record evidence
 
-1. Run `airec doctor --json`. Do not begin if WGC or both encoders are unavailable.
+1. Run `airec doctor --json`. Do not begin if screen capture or every encoder is unavailable.
 2. Discover stable targets with `airec list monitors --json` or `airec list windows --json`.
-3. For a bounded foreground task, run `airec record --window-handle <HWND> --duration <TIME> --out <FILE>.mp4 --json`.
+3. For a bounded foreground task, run `airec record --window-handle <ID> --duration <TIME> --out <FILE>.mp4 --json`.
 4. For work whose end is controlled separately, run `airec start ... --json`, retain the `session`, inspect it with `airec status --json`, then run `airec stop --session <ID> --json`.
 5. Read stdout as JSONL. Keep diagnostics from stderr separate.
 6. Confirm a terminal `saved` event, verify the reported file exists and is non-empty, and inspect `stop_reason` before treating the evidence as successful.
