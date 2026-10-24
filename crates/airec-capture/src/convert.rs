@@ -10,13 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use airec_core::{AirecError, ErrorCode};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFMediaBuffer, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_SOURCE_READERF_ERROR, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup,
-    MFVideoFormat_RGB32,
+    IMF2DBuffer, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_VERSION, MFCreateAttributes,
+    MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video, MFSTARTUP_FULL, MFShutdown,
+    MFStartup, MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::{Interface, PCWSTR};
@@ -248,6 +248,17 @@ struct FrameLayout {
     width: u32,
     height: u32,
     stride: i32,
+    display: DisplayArea,
+}
+
+/// The visible part of a decoded frame. H.264 frames are coded in 16-pixel macroblocks, and
+/// Media Foundation returns the padded frame with the visible area described separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayArea {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 struct TimestampSampler {
@@ -392,7 +403,10 @@ fn decode_with_media_foundation(
         }
         if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             let changed = current_layout(input, &reader)?;
-            if gif.is_some() && (changed.width != layout.width || changed.height != layout.height) {
+            if gif.is_some()
+                && (changed.display.width != layout.display.width
+                    || changed.display.height != layout.display.height)
+            {
                 return Err(decode_error(
                     input,
                     "handle media type change",
@@ -407,17 +421,21 @@ fn decode_with_media_foundation(
             let timing = sampler.observe(timestamp, sample_duration);
             if timing.selected {
                 if output_dimensions.is_none() {
-                    let (output_width, output_height) =
-                        scaled_dimensions(layout.width, layout.height, options.max_width)?;
+                    let (output_width, output_height) = scaled_dimensions(
+                        layout.display.width,
+                        layout.display.height,
+                        options.max_width,
+                    )?;
                     output_dimensions = Some((output_width, output_height));
                 }
                 let (output_width, output_height) =
                     output_dimensions.expect("GIF dimensions accompany its writer");
                 let bgra = copy_bgra_sample(input, &sample, layout)?;
+                let visible = crop_bgra(&bgra, layout.width, layout.display);
                 let scaled = downscale_bgra(
-                    &bgra,
-                    layout.width,
-                    layout.height,
+                    &visible,
+                    layout.display.width,
+                    layout.display.height,
                     output_width,
                     output_height,
                 );
@@ -450,7 +468,6 @@ fn decode_with_media_foundation(
                     let gif_height = u16::try_from(output_height)
                         .map_err(|_| dimension_error(output_width, output_height))?;
                     let (image, differ) = FrameDiffer::first(&scaled, gif_width, gif_height);
-                    let global_palette = fixed_gif_palette();
                     gif = Some(
                         GifEncoder::new(
                             writer
@@ -458,7 +475,7 @@ fn decode_with_media_foundation(
                                 .expect("GIF writer is consumed with the first frame"),
                             gif_width,
                             gif_height,
-                            &global_palette,
+                            &image.palette,
                         )
                         .map_err(|error| output_error(output, "write GIF header", error))?,
                     );
@@ -592,11 +609,53 @@ fn current_layout(input: &Path, reader: &IMFSourceReader) -> Result<FrameLayout,
             "decoded RGB32 stride is invalid",
         ));
     }
+    let full_frame = DisplayArea {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
     Ok(FrameLayout {
         width,
         height,
         stride,
+        display: display_aperture(&media_type, width, height).unwrap_or(full_frame),
     })
+}
+
+fn display_aperture(media_type: &IMFMediaType, width: u32, height: u32) -> Option<DisplayArea> {
+    // MFVideoArea: OffsetX and OffsetY are MFOffset { fract: u16, value: i16 }, followed by
+    // SIZE { cx: i32, cy: i32 }. Fractional offsets never occur in decoded H.264 frames.
+    let mut area = [0_u8; 16];
+    unsafe { media_type.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut area, None) }.ok()?;
+    let x = u32::try_from(i16::from_le_bytes([area[2], area[3]])).ok()?;
+    let y = u32::try_from(i16::from_le_bytes([area[6], area[7]])).ok()?;
+    let visible_width =
+        u32::try_from(i32::from_le_bytes([area[8], area[9], area[10], area[11]])).ok()?;
+    let visible_height =
+        u32::try_from(i32::from_le_bytes([area[12], area[13], area[14], area[15]])).ok()?;
+    let fits_frame = visible_width != 0
+        && visible_height != 0
+        && x.checked_add(visible_width)? <= width
+        && y.checked_add(visible_height)? <= height;
+    fits_frame.then_some(DisplayArea {
+        x,
+        y,
+        width: visible_width,
+        height: visible_height,
+    })
+}
+
+fn crop_bgra(bgra: &[u8], frame_width: u32, display: DisplayArea) -> Vec<u8> {
+    let frame_row_bytes = frame_width as usize * 4;
+    let visible_row_bytes = display.width as usize * 4;
+    let left_bytes = display.x as usize * 4;
+    bgra.chunks_exact(frame_row_bytes)
+        .skip(display.y as usize)
+        .take(display.height as usize)
+        .flat_map(|row| &row[left_bytes..left_bytes + visible_row_bytes])
+        .copied()
+        .collect()
 }
 
 fn copy_bgra_sample(
@@ -767,42 +826,9 @@ fn downscale_bgra(
     destination
 }
 
-#[cfg(test)]
-fn quantize_bgra(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
-        .map(|pixel| {
-            let blue = pixel[0] >> 6;
-            let green = pixel[1] >> 5;
-            let red = pixel[2] >> 5;
-            (red << 5) | (green << 2) | blue
-        })
-        .collect()
-}
-
-fn fixed_palette() -> [u8; 256 * 3] {
-    let mut palette = [0_u8; 256 * 3];
-    for index in 0_u16..=255 {
-        let red = ((index >> 5) & 0x07) as u8;
-        let green = ((index >> 2) & 0x07) as u8;
-        let blue = (index & 0x03) as u8;
-        let offset = usize::from(index) * 3;
-        palette[offset] = ((u16::from(red) * 255 + 3) / 7) as u8;
-        palette[offset + 1] = ((u16::from(green) * 255 + 3) / 7) as u8;
-        palette[offset + 2] = ((u16::from(blue) * 255 + 1) / 3) as u8;
-    }
-    palette
-}
-
-fn fixed_gif_palette() -> Palette {
-    Palette::new(
-        fixed_palette()
-            .chunks_exact(3)
-            .map(|color| [color[0], color[1], color[2]])
-            .collect(),
-    )
-}
-
-const COLOR_HISTOGRAM_SIZE: usize = 32 * 32 * 32;
+const HISTOGRAM_BITS: usize = 6;
+const HISTOGRAM_LEVELS: usize = 1 << HISTOGRAM_BITS;
+const COLOR_HISTOGRAM_SIZE: usize = HISTOGRAM_LEVELS * HISTOGRAM_LEVELS * HISTOGRAM_LEVELS;
 const INITIAL_PALETTE_COLORS: usize = 255;
 const DIFFERENCE_PALETTE_COLORS: usize = 255;
 
@@ -821,17 +847,13 @@ struct ColorBox {
 
 impl ColorBox {
     fn range_and_axis(&self) -> (u8, usize) {
-        let mut minimum = [31_u8; 3];
+        let mut minimum = [u8::MAX; 3];
         let mut maximum = [0_u8; 3];
         for &key in &self.bins {
-            let components = [
-                ((key >> 10) & 31) as u8,
-                ((key >> 5) & 31) as u8,
-                (key & 31) as u8,
-            ];
             for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(components[axis]);
-                maximum[axis] = maximum[axis].max(components[axis]);
+                let component = histogram_component(key, axis);
+                minimum[axis] = minimum[axis].min(component);
+                maximum[axis] = maximum[axis].max(component);
             }
         }
         let ranges = [
@@ -887,9 +909,13 @@ fn rgb_pixels(bgra: &[u8]) -> Vec<[u8; 3]> {
 }
 
 fn histogram_key(color: [u8; 3]) -> usize {
-    (usize::from(color[0] >> 3) << 10)
-        | (usize::from(color[1] >> 3) << 5)
-        | usize::from(color[2] >> 3)
+    color.into_iter().fold(0, |key, channel| {
+        (key << HISTOGRAM_BITS) | usize::from(channel >> (8 - HISTOGRAM_BITS))
+    })
+}
+
+fn histogram_component(key: usize, axis: usize) -> u8 {
+    ((key >> ((2 - axis) * HISTOGRAM_BITS)) & (HISTOGRAM_LEVELS - 1)) as u8
 }
 
 fn adaptive_palette(pixels: &[[u8; 3]], maximum_colors: usize) -> Vec<[u8; 3]> {
@@ -929,11 +955,9 @@ fn adaptive_palette(pixels: &[[u8; 3]], maximum_colors: usize) -> Vec<[u8; 3]> {
         };
         let mut color_box = boxes.swap_remove(selected);
         let (_, axis) = color_box.range_and_axis();
-        color_box.bins.sort_unstable_by_key(|&key| match axis {
-            0 => (key >> 10) & 31,
-            1 => (key >> 5) & 31,
-            _ => key & 31,
-        });
+        color_box
+            .bins
+            .sort_unstable_by_key(|&key| histogram_component(key, axis));
         let target = color_box.population.div_ceil(2);
         let mut accumulated = 0_u64;
         let mut split = 1_usize;
@@ -984,17 +1008,6 @@ fn color_error(left: [u8; 3], right: [u8; 3]) -> u32 {
             (difference * difference) as u32
         })
         .sum()
-}
-
-fn fixed_quantized_color(color: [u8; 3]) -> [u8; 3] {
-    let red = color[0] >> 5;
-    let green = color[1] >> 5;
-    let blue = color[2] >> 6;
-    [
-        ((u16::from(red) * 255 + 3) / 7) as u8,
-        ((u16::from(green) * 255 + 3) / 7) as u8,
-        ((u16::from(blue) * 255 + 1) / 3) as u8,
-    ]
 }
 
 fn nearest_palette_index(color: [u8; 3], palette: &[[u8; 3]]) -> usize {
@@ -1061,6 +1074,11 @@ struct FrameDiffer {
     global_palette: Palette,
 }
 
+struct PaletteUpdate {
+    changed: Vec<(usize, [u8; 3], u8)>,
+    error: u64,
+}
+
 impl FrameDiffer {
     fn first(bgra: &[u8], width: u16, height: u16) -> (GifFrame, Self) {
         let source = rgb_pixels(bgra);
@@ -1071,7 +1089,7 @@ impl FrameDiffer {
         colors.extend_from_slice(&opaque_colors);
         let palette = Palette::new(colors);
         let mut rendered = Vec::with_capacity(source.len());
-        let mut indexed = source
+        let indexed = source
             .iter()
             .map(|&color| {
                 let index = lookup.index(color);
@@ -1079,30 +1097,6 @@ impl FrameDiffer {
                 (index + 1) as u8
             })
             .collect();
-        let adaptive_error = source
-            .iter()
-            .zip(&rendered)
-            .map(|(&source, &rendered)| u64::from(color_error(source, rendered)))
-            .sum::<u64>();
-        let fixed_error = source
-            .iter()
-            .map(|&color| u64::from(color_error(color, fixed_quantized_color(color))))
-            .sum::<u64>();
-        let (image_palette, local_palette) = if adaptive_error <= fixed_error {
-            (palette.clone(), true)
-        } else {
-            indexed = source
-                .iter()
-                .map(|&color| {
-                    let red = color[0] >> 5;
-                    let green = color[1] >> 5;
-                    let blue = color[2] >> 6;
-                    (red << 5) | (green << 2) | blue
-                })
-                .collect();
-            rendered = source.iter().copied().map(fixed_quantized_color).collect();
-            (fixed_gif_palette(), false)
-        };
         (
             GifFrame {
                 left: 0,
@@ -1110,8 +1104,8 @@ impl FrameDiffer {
                 width,
                 height,
                 indexed,
-                palette: image_palette,
-                local_palette,
+                palette: palette.clone(),
+                local_palette: false,
                 transparent: false,
             },
             Self {
@@ -1144,97 +1138,58 @@ impl FrameDiffer {
             .iter()
             .map(|&(_, color)| color)
             .collect::<Vec<_>>();
-        let global_lookup = PaletteLookup::new(&candidate_colors, &self.global_palette.colors[1..]);
-        let mut global_replacements = vec![None; source.len()];
-        for &(index, color) in &candidates {
-            let palette_index = global_lookup.index(color);
-            let replacement = self.global_palette.colors[palette_index + 1];
-            if color_error(color, replacement) < color_error(color, self.rendered[index]) {
-                global_replacements[index] = Some((replacement, (palette_index + 1) as u8));
-            }
-        }
-        let global_error = source
-            .iter()
-            .enumerate()
-            .map(|(index, &color)| {
-                let rendered = global_replacements[index]
-                    .map(|(replacement, _)| replacement)
-                    .unwrap_or(self.rendered[index]);
-                u64::from(color_error(color, rendered))
-            })
-            .sum::<u64>();
-        let baseline_error = source
-            .iter()
-            .map(|&color| u64::from(color_error(color, fixed_quantized_color(color))))
-            .sum::<u64>();
-        if global_error <= baseline_error {
-            let changed = global_replacements
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, replacement)| {
-                    replacement.map(|(color, palette_index)| {
-                        self.rendered[index] = color;
-                        (index, palette_index)
-                    })
-                })
-                .collect::<Vec<_>>();
-            self.previous_source = source;
-            let difference = self.difference_image(changed, self.global_palette.clone(), true);
-            return self.choose_smaller_encoding(difference);
-        }
-
-        let opaque_colors = adaptive_palette(&candidate_colors, DIFFERENCE_PALETTE_COLORS);
-        let lookup = PaletteLookup::new(&candidate_colors, &opaque_colors);
-        let mut changed = Vec::new();
-        for (index, color) in candidates {
-            let palette_index = lookup.index(color);
-            let replacement = opaque_colors[palette_index];
-            if color_error(color, replacement) >= color_error(color, self.rendered[index]) {
-                continue;
-            }
-            self.rendered[index] = replacement;
-            changed.push((index, (palette_index + 1) as u8));
-        }
+        let global_update = self.palette_update(
+            &candidates,
+            &candidate_colors,
+            &self.global_palette.colors[1..],
+        );
+        let adaptive_colors = adaptive_palette(&candidate_colors, DIFFERENCE_PALETTE_COLORS);
+        let adaptive_update = self.palette_update(&candidates, &candidate_colors, &adaptive_colors);
         self.previous_source = source;
-        let mut colors = Vec::with_capacity(opaque_colors.len() + 1);
-        colors.push([0, 0, 0]);
-        colors.extend(opaque_colors);
-        let difference = self.difference_image(changed, Palette::new(colors), true);
-        self.choose_smaller_encoding(difference)
+
+        let (update, palette, local_palette) = if global_update.error <= adaptive_update.error {
+            (global_update, self.global_palette.clone(), false)
+        } else {
+            let mut colors = Vec::with_capacity(adaptive_colors.len() + 1);
+            colors.push([0, 0, 0]);
+            colors.extend(adaptive_colors);
+            (adaptive_update, Palette::new(colors), true)
+        };
+        let changed = update
+            .changed
+            .into_iter()
+            .map(|(index, color, palette_index)| {
+                self.rendered[index] = color;
+                (index, palette_index)
+            })
+            .collect();
+        self.difference_image(changed, palette, local_palette)
     }
 
-    fn choose_smaller_encoding(&mut self, difference: Option<GifFrame>) -> Option<GifFrame> {
-        let difference = difference?;
-        let indexed = self
-            .previous_source
-            .iter()
-            .map(|&color| {
-                let red = color[0] >> 5;
-                let green = color[1] >> 5;
-                let blue = color[2] >> 6;
-                (red << 5) | (green << 2) | blue
-            })
-            .collect::<Vec<_>>();
-        let fixed = GifFrame {
-            left: 0,
-            top: 0,
-            width: self.width,
-            height: self.height,
-            indexed,
-            palette: fixed_gif_palette(),
-            local_palette: false,
-            transparent: false,
-        };
-        if encoded_frame_size(&fixed) >= encoded_frame_size(&difference) {
-            return Some(difference);
+    /// Maps changed pixels onto `opaque_colors`, keeping only replacements that bring the
+    /// displayed canvas closer to the source. `error` covers every changed pixel, replaced or not.
+    fn palette_update(
+        &self,
+        candidates: &[(usize, [u8; 3])],
+        candidate_colors: &[[u8; 3]],
+        opaque_colors: &[[u8; 3]],
+    ) -> PaletteUpdate {
+        let lookup = PaletteLookup::new(candidate_colors, opaque_colors);
+        let mut changed = Vec::new();
+        let mut error = 0_u64;
+        for &(index, color) in candidates {
+            let palette_index = lookup.index(color);
+            let replacement = opaque_colors[palette_index];
+            let replacement_error = color_error(color, replacement);
+            let current_error = color_error(color, self.rendered[index]);
+            if replacement_error < current_error {
+                changed.push((index, replacement, (palette_index + 1) as u8));
+                error += u64::from(replacement_error);
+            } else {
+                error += u64::from(current_error);
+            }
         }
-        self.rendered = self
-            .previous_source
-            .iter()
-            .copied()
-            .map(fixed_quantized_color)
-            .collect();
-        Some(fixed)
+        PaletteUpdate { changed, error }
     }
 
     fn difference_image(
@@ -1278,16 +1233,6 @@ impl FrameDiffer {
             transparent: true,
         })
     }
-}
-
-fn encoded_frame_size(image: &GifFrame) -> usize {
-    let compressed = lzw_encode(&image.indexed, image.palette.minimum_code_size());
-    8 + 10
-        + usize::from(image.local_palette) * image.palette.table_size * 3
-        + 1
-        + compressed.len()
-        + compressed.len().div_ceil(255)
-        + 1
 }
 
 fn timeline_centiseconds(timestamp_hns: u64) -> u64 {
@@ -1532,14 +1477,105 @@ mod tests {
         path
     }
 
+    /// The 3-3-2 palette earlier releases used, kept as the benchmark baseline.
+    fn legacy_fixed_palette() -> Vec<[u8; 3]> {
+        (0_u16..=255)
+            .map(|index| {
+                let red = (index >> 5) & 0x07;
+                let green = (index >> 2) & 0x07;
+                let blue = index & 0x03;
+                [
+                    ((red * 255 + 3) / 7) as u8,
+                    ((green * 255 + 3) / 7) as u8,
+                    ((blue * 255 + 1) / 3) as u8,
+                ]
+            })
+            .collect()
+    }
+
+    fn legacy_quantize_bgra(bgra: &[u8]) -> Vec<u8> {
+        bgra.chunks_exact(4)
+            .map(|pixel| (pixel[2] >> 5) << 5 | (pixel[1] >> 5) << 2 | pixel[0] >> 6)
+            .collect()
+    }
+
+    fn solid_bgra(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
+        [rgb[2], rgb[1], rgb[0], 255].repeat(width * height)
+    }
+
     #[test]
-    fn fixed_palette_and_quantizer_are_stable() {
-        let palette = fixed_palette();
-        assert_eq!(&palette[0..3], &[0, 0, 0]);
-        assert_eq!(&palette[255 * 3..], &[255, 255, 255]);
-        assert_eq!(quantize_bgra(&[0, 0, 255, 255]), vec![0b1110_0000]);
-        assert_eq!(quantize_bgra(&[255, 0, 0, 255]), vec![0b0000_0011]);
-        assert_eq!(quantize_bgra(&[0, 255, 0, 255]), vec![0b0001_1100]);
+    fn dark_gray_first_frame_is_not_crushed_to_black() {
+        let frame = solid_bgra(8, 4, [20, 20, 20]);
+
+        let (_, differ) = FrameDiffer::first(&frame, 8, 4);
+
+        assert!(differ.rendered.iter().all(|&color| color == [20, 20, 20]));
+    }
+
+    #[test]
+    fn gray_ramp_first_frame_stays_within_histogram_precision() {
+        let frame = (0..=255_u8)
+            .flat_map(|level| [level, level, level, 255])
+            .collect::<Vec<_>>();
+
+        let (_, differ) = FrameDiffer::first(&frame, 256, 1);
+
+        let worst_channel_error = differ
+            .rendered
+            .iter()
+            .zip(0..=255_u8)
+            .map(|(color, level)| color[0].abs_diff(level))
+            .max()
+            .unwrap();
+        assert!(worst_channel_error <= 2, "error {worst_channel_error}");
+    }
+
+    #[test]
+    fn color_missing_from_first_palette_is_reproduced_by_local_palette() {
+        let first = solid_bgra(8, 4, [240, 240, 240]);
+        let mut second = first.clone();
+        second[..16].copy_from_slice(&solid_bgra(4, 1, [124, 58, 237]));
+        let (_, mut differ) = FrameDiffer::first(&first, 8, 4);
+
+        let difference = differ.difference(&second).unwrap();
+
+        assert!(difference.local_palette);
+        assert_eq!(&differ.rendered[..4], &[[124, 58, 237]; 4]);
+        assert_eq!(differ.rendered[4], [240, 240, 240]);
+    }
+
+    #[test]
+    fn color_already_in_first_palette_reuses_global_palette() {
+        let mut first = solid_bgra(8, 4, [240, 240, 240]);
+        first[..4].copy_from_slice(&solid_bgra(1, 1, [124, 58, 237]));
+        let mut second = first.clone();
+        second[4..8].copy_from_slice(&solid_bgra(1, 1, [124, 58, 237]));
+        let (_, mut differ) = FrameDiffer::first(&first, 8, 4);
+
+        let difference = differ.difference(&second).unwrap();
+
+        assert!(!difference.local_palette);
+        assert_eq!(differ.rendered[1], [124, 58, 237]);
+    }
+
+    #[test]
+    fn crop_keeps_only_the_display_aperture() {
+        let frame = (0..12_u8)
+            .flat_map(|pixel| [pixel, 0, 0, 255])
+            .collect::<Vec<_>>();
+        let display = DisplayArea {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+
+        let visible = crop_bgra(&frame, 4, display);
+
+        assert_eq!(
+            visible,
+            [5, 0, 0, 255, 6, 0, 0, 255, 9, 0, 0, 255, 10, 0, 0, 255]
+        );
     }
 
     #[test]
@@ -1786,15 +1822,12 @@ mod tests {
 
     fn benchmark_scenario(scenario: BenchmarkScenario, width: u16, height: u16) -> BenchmarkResult {
         let fixtures = fixture_frames(scenario, usize::from(width), usize::from(height));
-        let fixed_colors = fixed_palette()
-            .chunks_exact(3)
-            .map(|color| [color[0], color[1], color[2]])
-            .collect::<Vec<_>>();
+        let fixed_colors = legacy_fixed_palette();
         let fixed = Palette::new(fixed_colors.clone());
         let mut baseline = GifEncoder::new(Vec::new(), width, height, &fixed).unwrap();
         let mut baseline_error = 0_u128;
         for frame in &fixtures {
-            let indexed = quantize_bgra(frame);
+            let indexed = legacy_quantize_bgra(frame);
             let rendered = indexed
                 .iter()
                 .map(|&index| fixed_colors[usize::from(index)])
@@ -1819,11 +1852,14 @@ mod tests {
         let baseline_bytes = baseline.finish().unwrap().len();
 
         let adaptive_full_frame_bytes = if width == 960 {
-            let mut adaptive_full =
-                GifEncoder::new(Vec::new(), width, height, &fixed_gif_palette()).unwrap();
+            let mut adaptive_full = GifEncoder::new(Vec::new(), width, height, &fixed).unwrap();
             for frame in &fixtures {
                 let (image, _) = FrameDiffer::first(frame, width, height);
-                adaptive_full.write_frame(&image, 10).unwrap();
+                let local_image = GifFrame {
+                    local_palette: true,
+                    ..image
+                };
+                adaptive_full.write_frame(&local_image, 10).unwrap();
             }
             adaptive_full.finish().unwrap().len()
         } else {
@@ -1831,8 +1867,7 @@ mod tests {
         };
 
         let (first, mut differ) = FrameDiffer::first(&fixtures[0], width, height);
-        let mut optimized =
-            GifEncoder::new(Vec::new(), width, height, &fixed_gif_palette()).unwrap();
+        let mut optimized = GifEncoder::new(Vec::new(), width, height, &first.palette).unwrap();
         let mut optimized_error = pixel_error(&fixtures[0], &differ.rendered);
         let mut pending = first;
         let mut pending_delay = 10_u16;
@@ -1919,7 +1954,7 @@ mod tests {
         let expected_first = differ.rendered.clone();
         let second = differ.difference(&frames[1]).unwrap();
         let expected_second = differ.rendered.clone();
-        let mut encoder = GifEncoder::new(Vec::new(), 96, 54, &fixed_gif_palette()).unwrap();
+        let mut encoder = GifEncoder::new(Vec::new(), 96, 54, &first.palette).unwrap();
         encoder.write_frame(&first, 10).unwrap();
         encoder.write_frame(&second, 10).unwrap();
         let decoded = decode_gif_frames(&encoder.finish().unwrap());

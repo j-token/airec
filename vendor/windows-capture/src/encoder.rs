@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use windows::Foundation::{TimeSpan, TypedEventHandler};
+use windows::Foundation::{PropertyValue, TimeSpan, TypedEventHandler};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
 use windows::Media::Core::{
@@ -28,6 +28,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
+use windows::Win32::Media::MediaFoundation::{
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MFNominalRange_16_235,
+    MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
+};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11SurfaceFromDXGISurface;
 use windows::core::{HSTRING, Interface};
 
@@ -259,6 +263,27 @@ pub struct VideoSettingsBuilder {
     frame_rate: u32,
     pixel_aspect_ratio: (u32, u32),
     disabled: bool,
+    input_format: VideoInputFormat,
+}
+
+/// Pixel layout of buffers passed to [`VideoEncoder::send_frame_buffer`].
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
+pub enum VideoInputFormat {
+    /// Bottom-up BGRA. Media Foundation picks the YUV matrix from the frame size and the
+    /// stream carries no color description.
+    Bgra8,
+    /// Top-down NV12 already converted with the BT.709 limited-range matrix. The stream is
+    /// tagged as BT.709 so that every player decodes it with the same matrix.
+    Nv12Bt709,
+}
+
+impl VideoInputFormat {
+    fn subtype(self) -> windows::core::Result<HSTRING> {
+        match self {
+            Self::Bgra8 => MediaEncodingSubtypes::Bgra8(),
+            Self::Nv12Bt709 => MediaEncodingSubtypes::Nv12(),
+        }
+    }
 }
 
 impl VideoSettingsBuilder {
@@ -279,7 +304,14 @@ impl VideoSettingsBuilder {
             width,
             height,
             disabled: false,
+            input_format: VideoInputFormat::Bgra8,
         }
+    }
+
+    /// Sets the pixel layout of raw frame buffers.
+    pub const fn input_format(mut self, input_format: VideoInputFormat) -> Self {
+        self.input_format = input_format;
+        self
     }
 
     /// Sets the video codec/subtype (e.g., [`VideoSettingsSubType::HEVC`]).
@@ -330,6 +362,23 @@ impl VideoSettingsBuilder {
         properties.FrameRate()?.SetDenominator(1)?;
         properties.PixelAspectRatio()?.SetNumerator(self.pixel_aspect_ratio.0)?;
         properties.PixelAspectRatio()?.SetDenominator(self.pixel_aspect_ratio.1)?;
+
+        if self.input_format == VideoInputFormat::Nv12Bt709 {
+            // Untagged H.264 is decoded as BT.601 by some players and as BT.709 by others,
+            // including Chromium, so only an explicit color description reproduces the same
+            // colors everywhere. Media Foundation's decoder also ignores the matrix and falls
+            // back to BT.709 whenever the primaries are BT.709, so all four values must agree.
+            let color_attributes = [
+                (MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32),
+                (MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32),
+                (MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32),
+                (MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32),
+            ];
+            let attributes = properties.Properties()?;
+            for (key, value) in color_attributes {
+                attributes.Insert(key, &PropertyValue::CreateUInt32(value)?)?;
+            }
+        }
         Ok((properties, self.disabled))
     }
 }
@@ -883,6 +932,7 @@ impl VideoEncoder {
         let path = path.as_ref();
         let media_encoding_profile = MediaEncodingProfile::new()?;
 
+        let input_subtype = video_settings.input_format.subtype()?;
         let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
         media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
         let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
@@ -897,7 +947,7 @@ impl VideoEncoder {
         let target_color_format = ColorFormat::Bgra8;
 
         let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
-            &MediaEncodingSubtypes::Bgra8()?,
+            &input_subtype,
             video_encoding_properties_cfg.Width()?,
             video_encoding_properties_cfg.Height()?,
         )?;
@@ -1041,6 +1091,7 @@ impl VideoEncoder {
     ) -> Result<Self, VideoEncoderError> {
         let media_encoding_profile = MediaEncodingProfile::new()?;
 
+        let input_subtype = video_settings.input_format.subtype()?;
         let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
         media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
         let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
@@ -1055,7 +1106,7 @@ impl VideoEncoder {
         let target_color_format = ColorFormat::Bgra8;
 
         let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
-            &MediaEncodingSubtypes::Bgra8()?,
+            &input_subtype,
             video_encoding_properties_cfg.Width()?,
             video_encoding_properties_cfg.Height()?,
         )?;
@@ -1284,7 +1335,7 @@ impl VideoEncoder {
     }
 
     /// Sends a raw frame buffer (owned inside). Returns immediately.
-    /// Windows expects BGRA and bottom-to-top layout for this path.
+    /// The buffer layout is the configured [`VideoInputFormat`].
     #[inline]
     pub fn send_frame_buffer(&mut self, buffer: &[u8], timestamp: i64) -> Result<(), VideoEncoderError> {
         if self.is_video_disabled {

@@ -120,3 +120,22 @@ Building from source was the only install path, which required a Rust 1.85 toolc
 The user PATH is read and written through `HKCU:\Environment` rather than `[Environment]::SetEnvironmentVariable`, which rewrites the value as `REG_SZ` and would permanently expand any `%VAR%` entries the user already had. The existing value kind is preserved rather than normalized, and the registry write is followed by a `WM_SETTINGCHANGE` broadcast, which the .NET API would have sent on its own; without it, processes launched from Explorer keep the stale environment until sign-out. PATH is written only when it actually changes.
 
 Package managers were not used. winget and Scoop both want a published manifest in a third-party repository, which adds a review-gated step between tagging and users being able to install, and neither removes the need for a release asset the manifest points at. `cargo install --git` remains possible for Rust users but is not documented as the primary path, because it reintroduces the toolchain and compile time this decision exists to remove. Only x86_64 is published; the script rejects other architectures rather than installing a binary that cannot run, and ARM64 is accepted because it runs x86_64 under emulation.
+
+## D-024 — Color-faithful MP4 and GIF output
+
+Recordings looked shifted or banded depending on where they were viewed, and three separate causes were measured on a window showing known sRGB patches and gradients.
+
+MP4 frames were handed to Media Foundation as BGRA, and the transcoder chose the YUV matrix from the frame size: BT.601 for a 980×560 window, BT.709 for a 1600×900 one, ignoring any requested matrix. The stream carried no color description, so players had to guess, and they guess differently. ffmpeg-based players decode untagged H.264 as BT.601, which shifted saturated colors in HD recordings by up to 25 code values. airec now converts BGRA to NV12 itself with the BT.709 limited-range matrix, averaging each 2×2 block for chroma, and tags the stream with BT.709 matrix, primaries, transfer, and limited range. Tagging only the matrix as BT.601 was rejected because Media Foundation's decoder falls back to BT.709 whenever the primaries are BT.709, and size-dependent tags were rejected because the transcoder's size threshold is undocumented. Measured patch error is now at most 3 in ffmpeg, Chromium, and the Media Foundation decoder at both sizes.
+
+GIF conversion read the decoded frame size without the display aperture. H.264 is coded in 16-pixel macroblocks, so a 980-pixel-wide recording decoded as 992 pixels, with the padding shown as a green stripe and the picture squeezed horizontally. Frames are now cropped to `MF_MT_MINIMUM_DISPLAY_APERTURE`.
+
+The fixed 3-3-2 palette from D-021 is removed. It was chosen whenever its LZW stream was smaller, and adaptive updates were accepted whenever they were no worse than it, so scrolls and gradients degraded to 8 levels of red and green and 4 of blue, and dark grays such as `#141414` rendered black. The first frame's adaptive palette is now the global color table. Each difference frame is mapped onto both that palette and a fresh adaptive palette of its changed pixels, and whichever leaves less squared RGB error over the changed pixels is written. Error is no longer traded for size. The median-cut histogram also moved from 5 to 6 bits per channel, because 32 levels left visible steps in gray gradients; this tripled the synthetic benchmark's run time but added about 10% to the conversion of a real 6-second recording.
+
+| Scenario (D-021 benchmark) | D-021 bytes | Now bytes | D-021 RGB MSE | Now RGB MSE |
+| --- | ---: | ---: | ---: | ---: |
+| Near-static window and moving cursor | 119,604 | 100,854 | 37.6046 | 35.9447 |
+| Localized text change | 105,355 | 88,818 | 37.5129 | 36.0191 |
+| Large-area scroll | 212,771 | 588,062 | 530.1520 | 0.4020 |
+| Full-frame change | 21,192,892 | 21,452,518 | 416.0086 | 159.2880 |
+
+On the recorded 1600×900 test window, the static region of a full-size GIF rose from 23.6 dB to over 43 dB PSNR against its MP4.

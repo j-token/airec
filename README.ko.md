@@ -83,7 +83,7 @@ airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-
 airec record --window-handle 6758808 --process notepad.exe --duration 30s --out-dir .\rec
 ```
 
-출력은 yuv420p 비디오 전용 H.264를 담은 fragmented MP4입니다. 윈도우 기본 플레이어, 크롬, 깃허브 웹 플레이어에서 재생됩니다. fragmented라서 프로세스가 강제 종료돼도 그 시점까지의 영상이 재생 가능한 파일로 남습니다.
+출력은 yuv420p 비디오 전용 H.264를 담은 fragmented MP4입니다. BT.709 색 정보를 기록하므로 어느 플레이어에서나 같은 색으로 보입니다. 윈도우 기본 플레이어, 크롬, 깃허브 웹 플레이어에서 재생됩니다. fragmented라서 프로세스가 강제 종료돼도 그 시점까지의 영상이 재생 가능한 파일로 남습니다.
 
 ## 에이전트에서 사용하기
 
