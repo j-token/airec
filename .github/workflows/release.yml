@@ -42,6 +42,12 @@ jobs:
           if ($version -ne $manifest) {
             throw "tag $tag does not match workspace version $manifest"
           }
+          foreach ($plugin in '.claude-plugin/plugin.json', '.codex-plugin/plugin.json') {
+            $pluginVersion = (Get-Content $plugin -Raw | ConvertFrom-Json).version
+            if ($version -ne $pluginVersion) {
+              throw "tag $tag does not match $plugin version $pluginVersion"
+            }
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
         env:
