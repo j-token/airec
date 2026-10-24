@@ -61,7 +61,12 @@ fn convert_failure_is_one_structured_json_line() {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(value["event"], "error");
     assert_eq!(value["code"], "CAPTURE_INIT_FAILED");
-    assert_eq!(value["data"]["component"], "media_foundation_decoder");
+    let decoder = if cfg!(windows) {
+        "media_foundation_decoder"
+    } else {
+        "openh264_decoder"
+    };
+    assert_eq!(value["data"]["component"], decoder);
 }
 
 #[test]

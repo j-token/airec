@@ -1,12 +1,14 @@
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use airec_capture::{WindowsCaptureBackend, WindowsEncoderFactory, diagnose_encoders};
+use airec_capture::{
+    PlatformCaptureBackend, PlatformEncoderFactory, ScreenArea, diagnose_capture, diagnose_encoders,
+};
 use airec_core::{
     AirecError, CaptureBackend, CaptureFrame, CaptureTarget, ControlRequest, ControlResponse,
     EffectColor, EffectStyles, EncoderFactory, ErrorCode, Event, FailurePolicy, FrameProcessor,
@@ -18,18 +20,12 @@ use airec_effects::{RippleCompositor, ScreenRect, letterbox};
 use airec_input::{EventLogWriter, MouseHook, MouseSubscription};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITORINFO};
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows_capture::graphics_capture_api::GraphicsCaptureApi;
-use windows_capture::monitor::Monitor;
 
 use crate::args::{
     Cli, Command, FailureArg, JsonArgs, ListKind, QualityArg, RecordArgs, RecordingArgs, StartArgs,
     TargetArgs,
 };
-use crate::ipc;
+use crate::{ipc, process};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LaunchConfig {
@@ -76,7 +72,7 @@ pub fn execute(cli: Cli) -> Result<i32, (AirecError, bool)> {
 }
 
 fn list(kind: ListKind) -> Result<i32, (AirecError, bool)> {
-    let backend = WindowsCaptureBackend::new();
+    let backend = PlatformCaptureBackend::new();
     match kind {
         ListKind::Monitors(args) => {
             let monitors = backend.monitors().map_err(|error| (error, args.json))?;
@@ -308,11 +304,9 @@ fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
 }
 
 fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
-    let wgc = GraphicsCaptureApi::is_supported().unwrap_or(false);
+    let capture = diagnose_capture();
     let encoder = diagnose_encoders();
-    let value = serde_json::json!({
-        "wgc_supported": wgc,
-        "capture_border_suppression": GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false),
+    let mut value = serde_json::json!({
         "encoder": {
             "format": "H.264",
             "container": "FMPEG4",
@@ -326,22 +320,25 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
         "network": false,
         "keyboard_hook": false,
     });
+    if let Some(fields) = value.as_object_mut() {
+        fields.extend(capture.fields);
+    }
     if args.json {
         println!("{value}");
     } else {
-        println!("WGC: {}", if wgc { "supported" } else { "unavailable" });
+        println!("{}", capture.summary);
         println!(
             "Encoder: H.264 FMPEG4 (selected: {})",
             encoder.selected.unwrap_or("unavailable")
         );
     }
-    if wgc && encoder.selected.is_some() {
+    if capture.available && encoder.selected.is_some() {
         Ok(0)
-    } else if !wgc {
+    } else if !capture.available {
         Err((
             AirecError::new(
                 ErrorCode::CaptureInitFailed,
-                "Windows Graphics Capture is unavailable",
+                capture.unavailable_message,
                 value,
             ),
             args.json,
@@ -350,7 +347,7 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
         Err((
             AirecError::new(
                 ErrorCode::EncoderUnavailable,
-                "no H.264 Media Foundation encoder is available",
+                "no H.264 encoder is available",
                 value,
             ),
             args.json,
@@ -569,8 +566,8 @@ fn run_live(
     json: bool,
     shared: Option<Arc<SharedState>>,
 ) -> Result<i32, AirecError> {
-    let backend = WindowsCaptureBackend::new();
-    let encoder_factory = WindowsEncoderFactory;
+    let backend = PlatformCaptureBackend::new();
+    let encoder_factory = PlatformEncoderFactory;
     let need_input = options.effects || options.event_log.is_some();
     let timeline_origin_ms = Arc::new(AtomicU64::new(u64::MAX));
     let mouse_hook = if need_input {
@@ -759,7 +756,7 @@ fn aggregate_startup_failures(
 }
 
 fn create_pipeline(
-    backend: &WindowsCaptureBackend,
+    backend: &PlatformCaptureBackend,
     target: &ResolvedTarget,
     options: &RecordingOptions,
     mouse_hook: Option<&MouseHook>,
@@ -902,73 +899,14 @@ impl FrameProcessor for ClickProcessor {
 }
 
 fn target_viewport(target: &ResolvedTarget) -> Option<(ScreenRect, ScreenRect)> {
-    match target.kind {
-        TargetKind::Monitor => {
-            let index = target.id.trim_start_matches("monitor-").parse().ok()?;
-            let monitor = Monitor::from_index(index).ok()?;
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..MONITORINFO::default()
-            };
-            if !unsafe {
-                GetMonitorInfoW(
-                    windows::Win32::Graphics::Gdi::HMONITOR(monitor.as_raw_hmonitor()),
-                    &mut info,
-                )
-            }
-            .as_bool()
-            {
-                return None;
-            }
-            let rect = ScreenRect {
-                left: info.rcMonitor.left,
-                top: info.rcMonitor.top,
-                right: info.rcMonitor.right,
-                bottom: info.rcMonitor.bottom,
-            };
-            Some((rect, rect))
-        }
-        TargetKind::Window => {
-            let hwnd = HWND(target.hwnd? as *mut std::ffi::c_void);
-            let mut rect = RECT::default();
-            unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
-            let mut origin = POINT { x: 0, y: 0 };
-            if !unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool() {
-                return None;
-            }
-            let clip = ScreenRect {
-                left: origin.x,
-                top: origin.y,
-                right: origin.x + rect.right,
-                bottom: origin.y + rect.bottom,
-            };
-            let mut bounds = RECT::default();
-            if unsafe {
-                DwmGetWindowAttribute(
-                    hwnd,
-                    DWMWA_EXTENDED_FRAME_BOUNDS,
-                    (&raw mut bounds).cast(),
-                    std::mem::size_of::<RECT>() as u32,
-                )
-            }
-            .is_err()
-            {
-                bounds = RECT {
-                    left: clip.left,
-                    top: clip.top,
-                    right: clip.right,
-                    bottom: clip.bottom,
-                };
-            }
-            let mapping = ScreenRect {
-                left: bounds.left,
-                top: bounds.top,
-                right: bounds.right,
-                bottom: bounds.bottom,
-            };
-            Some((clip, mapping))
-        }
-    }
+    let viewport = airec_capture::target_viewport(target)?;
+    let rect = |area: ScreenArea| ScreenRect {
+        left: area.left,
+        top: area.top,
+        right: area.right,
+        bottom: area.bottom,
+    };
+    Some((rect(viewport.clip), rect(viewport.mapping)))
 }
 
 fn prepare(
@@ -984,7 +922,7 @@ fn prepare(
     }
     let target_specs = target_specs(targets)?;
     let (output, directory) = output_path(recording);
-    let backend = WindowsCaptureBackend::new();
+    let backend = PlatformCaptureBackend::new();
     let resolved = backend.resolve(&target_specs, &output, directory)?;
     Ok((resolved, options))
 }
@@ -1586,77 +1524,13 @@ fn spawn_detached(config: &Path) -> Result<(), AirecError> {
 }
 
 fn spawn_detached_process(executable: &Path, arguments: &[&OsStr]) -> Result<(), AirecError> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS,
-        PROCESS_INFORMATION, STARTUPINFOW,
-    };
-    use windows::core::{PCWSTR, PWSTR};
-
-    let mut executable_wide: Vec<u16> = executable.as_os_str().encode_wide().collect();
-    executable_wide.push(0);
-    let mut command_line = Vec::new();
-    push_windows_argument(&mut command_line, executable.as_os_str());
-    for argument in arguments {
-        command_line.push(u16::from(b' '));
-        push_windows_argument(&mut command_line, argument);
-    }
-    command_line.push(0);
-
-    let startup = STARTUPINFOW {
-        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
-            .expect("STARTUPINFOW size fits in u32"),
-        ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    unsafe {
-        CreateProcessW(
-            PCWSTR(executable_wide.as_ptr()),
-            Some(PWSTR(command_line.as_mut_ptr())),
-            None,
-            None,
-            false,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-            None,
-            PCWSTR::null(),
-            &startup,
-            &mut process,
+    process::spawn_detached_process(executable, arguments).map_err(|message| {
+        AirecError::new(
+            ErrorCode::CaptureInitFailed,
+            message,
+            serde_json::json!({"component": "detach"}),
         )
-        .map_err(|error| {
-            AirecError::new(
-                ErrorCode::CaptureInitFailed,
-                error.to_string(),
-                serde_json::json!({"component": "detach"}),
-            )
-        })?;
-        let _ = CloseHandle(process.hThread);
-        let _ = CloseHandle(process.hProcess);
-    }
-    Ok(())
-}
-
-fn push_windows_argument(command_line: &mut Vec<u16>, argument: &OsStr) {
-    use std::os::windows::ffi::OsStrExt;
-
-    command_line.push(u16::from(b'"'));
-    let mut backslashes = 0_usize;
-    for unit in argument.encode_wide() {
-        if unit == u16::from(b'\\') {
-            backslashes += 1;
-        } else if unit == u16::from(b'"') {
-            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
-            command_line.push(unit);
-            backslashes = 0;
-        } else {
-            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
-            command_line.push(unit);
-            backslashes = 0;
-        }
-    }
-    command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
-    command_line.push(u16::from(b'"'));
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -1721,35 +1595,16 @@ fn test_hold(args: crate::args::TestHoldArgs) -> Result<i32, AirecError> {
 }
 
 fn install_diagnostic_stderr(session: &str) -> Result<File, AirecError> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
-
     let path = diagnostics_path(session)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .share_mode(0x1 | 0x2 | 0x4)
-        .open(&path)
-        .map_err(|error| {
-            AirecError::new(
-                ErrorCode::OutputIoError,
-                error.to_string(),
-                serde_json::json!({"path": path}),
-            )
-        })?;
-    unsafe {
-        SetStdHandle(STD_ERROR_HANDLE, HANDLE(file.as_raw_handle())).map_err(|error| {
-            AirecError::new(
-                ErrorCode::OutputIoError,
-                error.to_string(),
-                serde_json::json!({"path": path}),
-            )
-        })?;
-    }
+    let io_error = |message: String| {
+        AirecError::new(
+            ErrorCode::OutputIoError,
+            message,
+            serde_json::json!({"path": path}),
+        )
+    };
+    let file = process::open_diagnostic_log(&path).map_err(|error| io_error(error.to_string()))?;
+    process::redirect_stderr(&file).map_err(io_error)?;
     Ok(file)
 }
 

@@ -1,6 +1,12 @@
 mod args;
 mod config;
 mod ipc;
+#[cfg(target_os = "linux")]
+#[path = "process_linux.rs"]
+mod process;
+#[cfg(windows)]
+#[path = "process_windows.rs"]
+mod process;
 mod runtime;
 
 use std::process::ExitCode;

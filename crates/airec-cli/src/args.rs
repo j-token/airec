@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "airec",
     version,
-    about = "Windows CLI screen recorder for AI work evidence"
+    about = "CLI screen recorder for AI work evidence on Windows and Linux (X11)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,7 +25,7 @@ pub enum Command {
     Status(JsonArgs),
     /// Finalize and stop a detached recording session.
     Stop(StopArgs),
-    /// Diagnose Windows Graphics Capture and encoder configuration.
+    /// Diagnose screen capture and encoder configuration.
     Doctor(JsonArgs),
     /// Convert a recorded MP4 to an animated GIF.
     Convert(ConvertArgs),
@@ -86,7 +86,7 @@ pub struct TargetArgs {
     /// Window title substring; repeat for multiple windows.
     #[arg(long)]
     pub window: Vec<String>,
-    /// Decimal or 0x-prefixed HWND; repeat for multiple windows.
+    /// Decimal or 0x-prefixed HWND, or X11 window id on Linux; repeat for multiple windows.
     #[arg(long = "window-handle", value_parser = parse_hwnd)]
     pub window_handle: Vec<isize>,
     /// Process executable name; all matching top-level windows are recorded.
