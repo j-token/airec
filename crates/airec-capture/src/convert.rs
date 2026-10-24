@@ -10,13 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use airec_core::{AirecError, ErrorCode};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFMediaBuffer, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_SOURCE_READERF_ERROR, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup,
-    MFVideoFormat_RGB32,
+    IMF2DBuffer, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_VERSION, MFCreateAttributes,
+    MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video, MFSTARTUP_FULL, MFShutdown,
+    MFStartup, MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::{Interface, PCWSTR};
@@ -248,6 +248,17 @@ struct FrameLayout {
     width: u32,
     height: u32,
     stride: i32,
+    display: DisplayArea,
+}
+
+/// The visible part of a decoded frame. H.264 frames are coded in 16-pixel macroblocks, and
+/// Media Foundation returns the padded frame with the visible area described separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayArea {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 struct TimestampSampler {
@@ -392,7 +403,10 @@ fn decode_with_media_foundation(
         }
         if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             let changed = current_layout(input, &reader)?;
-            if gif.is_some() && (changed.width != layout.width || changed.height != layout.height) {
+            if gif.is_some()
+                && (changed.display.width != layout.display.width
+                    || changed.display.height != layout.display.height)
+            {
                 return Err(decode_error(
                     input,
                     "handle media type change",
@@ -407,17 +421,21 @@ fn decode_with_media_foundation(
             let timing = sampler.observe(timestamp, sample_duration);
             if timing.selected {
                 if output_dimensions.is_none() {
-                    let (output_width, output_height) =
-                        scaled_dimensions(layout.width, layout.height, options.max_width)?;
+                    let (output_width, output_height) = scaled_dimensions(
+                        layout.display.width,
+                        layout.display.height,
+                        options.max_width,
+                    )?;
                     output_dimensions = Some((output_width, output_height));
                 }
                 let (output_width, output_height) =
                     output_dimensions.expect("GIF dimensions accompany its writer");
                 let bgra = copy_bgra_sample(input, &sample, layout)?;
+                let visible = crop_bgra(&bgra, layout.width, layout.display);
                 let scaled = downscale_bgra(
-                    &bgra,
-                    layout.width,
-                    layout.height,
+                    &visible,
+                    layout.display.width,
+                    layout.display.height,
                     output_width,
                     output_height,
                 );
@@ -592,11 +610,53 @@ fn current_layout(input: &Path, reader: &IMFSourceReader) -> Result<FrameLayout,
             "decoded RGB32 stride is invalid",
         ));
     }
+    let full_frame = DisplayArea {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
     Ok(FrameLayout {
         width,
         height,
         stride,
+        display: display_aperture(&media_type, width, height).unwrap_or(full_frame),
     })
+}
+
+fn display_aperture(media_type: &IMFMediaType, width: u32, height: u32) -> Option<DisplayArea> {
+    // MFVideoArea: OffsetX and OffsetY are MFOffset { fract: u16, value: i16 }, followed by
+    // SIZE { cx: i32, cy: i32 }. Fractional offsets never occur in decoded H.264 frames.
+    let mut area = [0_u8; 16];
+    unsafe { media_type.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut area, None) }.ok()?;
+    let x = u32::try_from(i16::from_le_bytes([area[2], area[3]])).ok()?;
+    let y = u32::try_from(i16::from_le_bytes([area[6], area[7]])).ok()?;
+    let visible_width =
+        u32::try_from(i32::from_le_bytes([area[8], area[9], area[10], area[11]])).ok()?;
+    let visible_height =
+        u32::try_from(i32::from_le_bytes([area[12], area[13], area[14], area[15]])).ok()?;
+    let fits_frame = visible_width != 0
+        && visible_height != 0
+        && x.checked_add(visible_width)? <= width
+        && y.checked_add(visible_height)? <= height;
+    fits_frame.then_some(DisplayArea {
+        x,
+        y,
+        width: visible_width,
+        height: visible_height,
+    })
+}
+
+fn crop_bgra(bgra: &[u8], frame_width: u32, display: DisplayArea) -> Vec<u8> {
+    let frame_row_bytes = frame_width as usize * 4;
+    let visible_row_bytes = display.width as usize * 4;
+    let left_bytes = display.x as usize * 4;
+    bgra.chunks_exact(frame_row_bytes)
+        .skip(display.y as usize)
+        .take(display.height as usize)
+        .flat_map(|row| &row[left_bytes..left_bytes + visible_row_bytes])
+        .copied()
+        .collect()
 }
 
 fn copy_bgra_sample(
@@ -1540,6 +1600,26 @@ mod tests {
         assert_eq!(quantize_bgra(&[0, 0, 255, 255]), vec![0b1110_0000]);
         assert_eq!(quantize_bgra(&[255, 0, 0, 255]), vec![0b0000_0011]);
         assert_eq!(quantize_bgra(&[0, 255, 0, 255]), vec![0b0001_1100]);
+    }
+
+    #[test]
+    fn crop_keeps_only_the_display_aperture() {
+        let frame = (0..12_u8)
+            .flat_map(|pixel| [pixel, 0, 0, 255])
+            .collect::<Vec<_>>();
+        let display = DisplayArea {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+
+        let visible = crop_bgra(&frame, 4, display);
+
+        assert_eq!(
+            visible,
+            [5, 0, 0, 255, 6, 0, 0, 255, 9, 0, 0, 255, 10, 0, 0, 255]
+        );
     }
 
     #[test]
