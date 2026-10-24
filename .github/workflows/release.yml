@@ -6,24 +6,80 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to build and publish (e.g. v0.2.2)"
+      version:
+        description: "Version to release without the v prefix (e.g. 0.3.0). Bumps Cargo.toml, Cargo.lock and both plugin manifests on main, then tags v<version>."
         required: true
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-pc-windows-msvc
 
 jobs:
+  bump:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump version
+        id: bump
+        shell: pwsh
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          $version = $env:VERSION.Trim() -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "version '$version' is not semver (e.g. 0.3.0)"
+          }
+          $tag = "v$version"
+          git fetch --tags --quiet
+          if (git tag --list $tag) { throw "tag $tag already exists" }
+
+          $cargo = Get-Content Cargo.toml -Raw
+          $cargo = ([regex]'(?m)^version\s*=\s*"[^"]*"').Replace($cargo, "version = `"$version`"", 1)
+          Set-Content Cargo.toml $cargo -NoNewline
+          cargo update --workspace
+          if ($LASTEXITCODE -ne 0) { throw "cargo update --workspace failed" }
+
+          foreach ($plugin in '.claude-plugin/plugin.json', '.codex-plugin/plugin.json') {
+            $json = Get-Content $plugin -Raw
+            $json = ([regex]'"version"\s*:\s*"[^"]*"').Replace($json, "`"version`": `"$version`"", 1)
+            Set-Content $plugin $json -NoNewline
+          }
+
+          git diff --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock .claude-plugin/plugin.json .codex-plugin/plugin.json
+          git commit -m "misc: 버전을 $version(으)로 올림"
+          if ($LASTEXITCODE -ne 0) { throw "nothing to commit; main is already at $version" }
+          git tag $tag
+          git push origin HEAD:main $tag
+          if ($LASTEXITCODE -ne 0) { throw "push failed" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
   release:
+    needs: bump
+    if: ${{ !cancelled() && (needs.bump.result == 'success' || needs.bump.result == 'skipped') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.bump.outputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -36,7 +92,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { "${{ github.ref_name }}" }
+          $tag = if ($env:BUMPED_TAG) { $env:BUMPED_TAG } else { "${{ github.ref_name }}" }
           $version = $tag -replace '^v', ''
           $manifest = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           if ($version -ne $manifest) {
@@ -51,7 +107,7 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
         env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          BUMPED_TAG: ${{ needs.bump.outputs.tag }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ env.TARGET }} --bin airec
