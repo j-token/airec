@@ -137,14 +137,37 @@ Errors are structured, and the exit code matches the code:
 
 `AMBIGUOUS_TARGET` returns the candidate windows in `data`, so an agent can narrow the query on its own instead of guessing.
 
-All of this is packaged as an agent skill under `skills/airec`, so the agent starts out knowing the commands and the `stop_reason` rule:
+All of this is packaged as an agent skill under `skills/airec`, so the agent starts out knowing the commands and the `stop_reason` rule.
+
+The skill is instructions, not the recorder. Whichever way you install the skill, install the CLI first, or the agent will call a command that does not exist:
 
 ```powershell
 irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+```
+
+To install it as a Claude Code plugin, run the following in a shell. Inside a Claude Code session, use `/plugin` in place of `claude plugin`.
+
+```powershell
+claude plugin marketplace add j-token/airec
+claude plugin install airec@airec
+```
+
+To install it as a Codex plugin, run the following, or pick it from `/plugins` inside `codex`. The skill appears in new sessions.
+
+```powershell
+codex plugin marketplace add j-token/airec
+codex plugin add airec@airec
+```
+
+The plugin version matches the release version, so the skill updates when a new release ships. Claude Code updates with `claude plugin update airec@airec`. Codex updates with `codex plugin marketplace upgrade airec` followed by `codex plugin add airec@airec` again.
+
+For other agents, install with the Skills CLI:
+
+```powershell
 npx skills add j-token/airec --skill airec
 ```
 
-The skill is instructions, not the recorder, so the first line is not optional: install the CLI too or the agent will call a command that does not exist. Add `-g` to the second line to install the skill for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
+Add `-g` to install the skill for every project instead of the current one. Without `--skill airec` the CLI also lists this repository's own workflow skills, which are not part of the recorder.
 
 > Do not run `npx skills add` inside a clone of this repository. The Skills CLI writes the skill to `.agents/skills/<name>` and points the discovery directories at it with symlinks. When a real `skills/<name>` directory is already there it replaces that directory with the symlink, and the files that were in it are gone with no warning and no backup. In this repository `skills/airec` is the skill's source, so installing here destroys it. Elsewhere this only matters if you keep a skill of your own under the same name.
 
