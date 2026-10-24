@@ -1,0 +1,16 @@
+{
+  "name": "airec",
+  "description": "The airec screen recorder skill for AI agents working on Windows.",
+  "owner": {
+    "name": "j-token",
+    "url": "https://github.com/j-token"
+  },
+  "plugins": [
+    {
+      "name": "airec",
+      "source": "./",
+      "description": "Record Windows screen evidence of an agent's work with the airec CLI and convert it to GIF.",
+      "category": "productivity"
+    }
+  ]
+}

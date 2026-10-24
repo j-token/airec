@@ -139,3 +139,19 @@ The fixed 3-3-2 palette from D-021 is removed. It was chosen whenever its LZW st
 | Full-frame change | 21,192,892 | 21,452,518 | 416.0086 | 159.2880 |
 
 On the recorded 1600×900 test window, the static region of a full-size GIF rose from 23.6 dB to over 43 dB PSNR against its MP4.
+
+## D-025 — Claude Code and Codex plugin distribution
+
+The skill is also published as a Claude Code plugin and a Codex plugin, so those agents install it through their own plugin commands instead of the Skills CLI. The repository root is both the plugin and its single-plugin marketplace for each agent. Claude Code reads `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`, whose entry has source `"./"`. Codex reads `.codex-plugin/plugin.json` and `.agents/plugins/marketplace.json`, whose entry has the local source path `"./"`. Both marketplaces and the plugin are named `airec`, so the install id is `airec@airec` in both agents. `skills/airec/` stays the only copy of the skill, which keeps D-022's Skills CLI path working unchanged.
+
+Codex also reads the Claude manifests as a fallback, but its documented marketplace entry carries `policy` and `category`, and its manifest carries `interface` display metadata that Claude Code does not read. Each agent therefore gets the manifests its own documentation describes rather than one shared pair.
+
+Claude Code auto-discovers skills only under the plugin root's `skills/` directory, and the Codex manifest names `./skills/` explicitly. The repository's own workflow skills under `.agents/skills` are copied into the plugin cache along with the rest of the repository but are not loaded; `claude plugin details` lists `airec` as the only component.
+
+Both manifests carry the workspace version, and the release workflow refuses a tag that disagrees with either of them. A declared version means installed copies update only when it changes, so the skill users receive always matches a published CLI release rather than whatever was last merged. Omitting the version was rejected for that reason: Claude Code would then treat every commit as an update and could ship instructions for flags that no released `airec.exe` has.
+
+## D-026 — Release workflow bumps the version
+
+With D-025 a release needed the same version written by hand in three files plus `Cargo.lock` before tagging. The release workflow's manual run now takes a `version` input and does that itself. A `bump` job checks out `main`, rewrites the workspace version in `Cargo.toml`, runs `cargo update --workspace` so only the workspace crates move in `Cargo.lock`, sets `version` in both plugin manifests, commits `misc: 버전을 <version>(으)로 올림` as `github-actions[bot]`, and pushes the commit to `main` together with the tag `v<version>`. The `release` job then builds that tag. It refuses input that is not semver or whose tag already exists.
+
+`Cargo.lock` is updated by Cargo rather than by text replacement, because third-party packages can share the old version string. A tag pushed with `GITHUB_TOKEN` does not start another workflow run, so the jobs are chained with `needs` instead of relying on the tag push. Pushing a hand-made `v*` tag still releases it, with the same consistency check. The direct push to `main` depends on `main` having no protection rule that blocks `github-actions[bot]`; adding one later means switching the bump to a pull request or a token allowed to bypass it.

@@ -139,12 +139,35 @@ airec record --monitor all --on-failure abort      # 전체를 finalize하고 �
 
 이 내용은 `skills/airec`에 에이전트 스킬로 정리돼 있습니다. 설치하면 에이전트가 명령어와 `stop_reason` 판정 규칙을 아는 상태로 시작합니다.
 
+스킬은 사용법 문서지 녹화기 자체가 아닙니다. 어떤 방법으로 스킬을 설치하든 CLI를 먼저 깔아야 합니다. 빼먹으면 에이전트가 없는 명령어를 호출하게 됩니다.
+
 ```powershell
 irm https://raw.githubusercontent.com/j-token/airec/main/install.ps1 | iex
+```
+
+Claude Code 플러그인으로 설치하려면 셸에서 다음을 실행합니다. Claude Code 세션 안에서는 `claude` 대신 `/plugin`으로 같은 명령을 씁니다.
+
+```powershell
+claude plugin marketplace add j-token/airec
+claude plugin install airec@airec
+```
+
+Codex 플러그인으로 설치하려면 다음을 실행합니다. `codex`를 띄운 뒤 `/plugins`에서 골라도 됩니다. 스킬은 새 세션부터 보입니다.
+
+```powershell
+codex plugin marketplace add j-token/airec
+codex plugin add airec@airec
+```
+
+플러그인 버전은 릴리즈 버전과 같아서, 새 릴리즈가 나올 때 스킬도 같이 갱신됩니다. Claude Code는 `claude plugin update airec@airec`로, Codex는 `codex plugin marketplace upgrade airec` 뒤에 `codex plugin add airec@airec`를 다시 실행해 갱신합니다.
+
+그 밖의 에이전트에서는 Skills CLI로 설치합니다.
+
+```powershell
 npx skills add j-token/airec --skill airec
 ```
 
-스킬은 사용법 문서지 녹화기 자체가 아닙니다. 첫 줄을 빼면 에이전트가 없는 명령어를 호출하게 되니 CLI도 같이 깔아야 합니다. 둘째 줄에 `-g`를 붙이면 현재 프로젝트가 아니라 전체 프로젝트에 설치됩니다. `--skill airec`을 빼면 이 저장소의 내부 워크플로 스킬까지 함께 목록에 잡히는데, 그건 녹화기와 무관합니다.
+`-g`를 붙이면 현재 프로젝트가 아니라 전체 프로젝트에 설치됩니다. `--skill airec`을 빼면 이 저장소의 내부 워크플로 스킬까지 함께 목록에 잡히는데, 그건 녹화기와 무관합니다.
 
 > 이 저장소를 클론한 곳에서는 `npx skills add`를 실행하지 마십시오. Skills CLI는 스킬을 `.agents/skills/<이름>`에 쓰고 탐색 디렉터리들을 그쪽으로 심볼릭 링크합니다. 그런데 같은 이름의 실제 `skills/<이름>` 디렉터리가 이미 있으면 그 디렉터리를 링크로 갈아치웁니다. 안에 있던 파일은 경고도 백업도 없이 사라집니다. 이 저장소에서 `skills/airec`은 스킬의 원본이라, 여기서 설치하면 원본이 날아갑니다. 다른 곳에서는 같은 이름의 스킬을 직접 두고 있을 때만 해당됩니다.
 
