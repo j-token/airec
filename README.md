@@ -83,7 +83,7 @@ airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-
 airec record --window-handle 6758808 --process notepad.exe --duration 30s --out-dir .\rec
 ```
 
-Output is video-only H.264 in a fragmented MP4 at yuv420p, which plays in the Windows player, in Chrome, and in the GitHub web player. Fragmented means a killed process still leaves a playable file covering everything recorded up to that point.
+Output is video-only H.264 in a fragmented MP4 at yuv420p, tagged as BT.709 so every player shows the same colors. It plays in the Windows player, in Chrome, and in the GitHub web player. Fragmented means a killed process still leaves a playable file covering everything recorded up to that point.
 
 ## Driving it from an agent
 

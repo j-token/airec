@@ -7,7 +7,7 @@ use airec_core::{
 };
 use windows_capture::encoder::{
     AudioSettingsBuilder, ContainerSettingsBuilder, ContainerSettingsSubType, VideoEncoder,
-    VideoSettingsBuilder, VideoSettingsSubType,
+    VideoInputFormat, VideoSettingsBuilder, VideoSettingsSubType,
 };
 
 #[derive(Default)]
@@ -92,7 +92,7 @@ fn probe_encoder_mode(
     };
     let result = (|| {
         let mut encoder = create_encoder(&config, hardware_acceleration)?;
-        let frame = vec![0_u8; config.width as usize * config.height as usize * 4];
+        let frame = vec![0_u8; config.width as usize * config.height as usize * 3 / 2];
         encoder.send_frame_buffer_at_timeline(&frame, 0)?;
         encoder.wait_until_ready(std::time::Duration::from_secs(2))?;
         encoder.finish()
@@ -203,6 +203,7 @@ fn create_encoder(
     VideoEncoder::new(
         VideoSettingsBuilder::new(config.width, config.height)
             .sub_type(VideoSettingsSubType::H264)
+            .input_format(VideoInputFormat::Nv12Bt709)
             .bitrate(config.bitrate)
             .frame_rate(config.fps),
         AudioSettingsBuilder::new().disabled(true),
@@ -224,7 +225,7 @@ impl PipelineEncoder for MfEncoder {
     fn write_frame(&mut self, frame: &CaptureFrame) -> Result<(), AirecError> {
         let width = even(frame.width);
         let height = even(frame.height);
-        let packed = packed_bottom_up(frame, width, height);
+        let packed = nv12_bt709(frame, width, height);
         let timestamp_hns = i64::try_from(frame.t_ms.saturating_mul(10_000)).unwrap_or(i64::MAX);
         let first_result = self
             .encoder
@@ -289,21 +290,60 @@ fn encoder_unavailable(
     )
 }
 
-fn packed_bottom_up(frame: &CaptureFrame, width: u32, height: u32) -> Vec<u8> {
-    let row_bytes = width as usize * 4;
-    let mut output = vec![0_u8; row_bytes * height as usize];
-    let copy_width = width.min(frame.width) as usize * 4;
-    let copy_height = height.min(frame.height);
-    for y in 0..copy_height {
-        let source = y as usize * frame.stride as usize;
-        let destination_y = height - 1 - y;
-        let destination = destination_y as usize * row_bytes;
-        if source + copy_width <= frame.bgra.len() {
-            output[destination..destination + copy_width]
-                .copy_from_slice(&frame.bgra[source..source + copy_width]);
+/// Converts a frame to top-down NV12 with the BT.709 limited-range matrix, averaging each
+/// 2x2 block for chroma. Padding added to reach even dimensions is black.
+fn nv12_bt709(frame: &CaptureFrame, width: u32, height: u32) -> Vec<u8> {
+    let width = width as usize;
+    let height = height as usize;
+    let rgb_at = |x: usize, y: usize| -> [i32; 3] {
+        if x >= frame.width as usize || y >= frame.height as usize {
+            return [0, 0, 0];
+        }
+        let offset = y * frame.stride as usize + x * 4;
+        match frame.bgra.get(offset..offset + 3) {
+            Some(&[blue, green, red]) => [i32::from(red), i32::from(green), i32::from(blue)],
+            _ => [0, 0, 0],
+        }
+    };
+
+    let mut nv12 = vec![0_u8; width * height * 3 / 2];
+    let (luma, chroma) = nv12.split_at_mut(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            luma[y * width + x] = bt709_luma(rgb_at(x, y));
         }
     }
-    output
+    for y in (0..height).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let block = [
+                rgb_at(x, y),
+                rgb_at(x + 1, y),
+                rgb_at(x, y + 1),
+                rgb_at(x + 1, y + 1),
+            ];
+            let average =
+                |channel: usize| (block.iter().map(|rgb| rgb[channel]).sum::<i32>() + 2) / 4;
+            let offset = y / 2 * width + x;
+            chroma[offset..offset + 2].copy_from_slice(&bt709_chroma([
+                average(0),
+                average(1),
+                average(2),
+            ]));
+        }
+    }
+    nv12
+}
+
+// BT.709 limited-range coefficients scaled by 2^16. Each chroma row sums to zero so that
+// grays map exactly to 128.
+fn bt709_luma([red, green, blue]: [i32; 3]) -> u8 {
+    (16 + ((11_966 * red + 40_254 * green + 4_064 * blue + 32_768) >> 16)) as u8
+}
+
+fn bt709_chroma([red, green, blue]: [i32; 3]) -> [u8; 2] {
+    let blue_difference = (-6_596 * red - 22_188 * green + 28_784 * blue + 32_768) >> 16;
+    let red_difference = (28_784 * red - 26_145 * green - 2_639 * blue + 32_768) >> 16;
+    [(128 + blue_difference) as u8, (128 + red_difference) as u8]
 }
 
 fn encoder_error(error: windows_capture::encoder::VideoEncoderError) -> AirecError {
@@ -332,22 +372,49 @@ mod tests {
         assert_eq!(even(1081), 1082);
     }
 
-    #[test]
-    fn padded_rows_are_removed_and_frame_is_flipped_for_media_foundation() {
-        let frame = CaptureFrame {
-            width: 2,
-            height: 2,
-            stride: 12,
-            bgra: vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99, 99,
-                99,
-            ],
+    fn solid_frame(width: u32, height: u32, stride: u32, rgb: [u8; 3]) -> CaptureFrame {
+        let row = [rgb[2], rgb[1], rgb[0], 255]
+            .repeat(width as usize)
+            .into_iter()
+            .chain(std::iter::repeat_n(99, (stride - width * 4) as usize))
+            .collect::<Vec<_>>();
+        CaptureFrame {
+            width,
+            height,
+            stride,
+            bgra: row.repeat(height as usize),
             t_ms: 0,
-        };
-        assert_eq!(
-            packed_bottom_up(&frame, 2, 2),
-            vec![9, 10, 11, 12, 13, 14, 15, 16, 1, 2, 3, 4, 5, 6, 7, 8]
-        );
+        }
+    }
+
+    #[test]
+    fn bt709_limited_range_maps_reference_colors() {
+        assert_eq!(bt709_luma([0, 0, 0]), 16);
+        assert_eq!(bt709_luma([255, 255, 255]), 235);
+        assert_eq!(bt709_chroma([128, 128, 128]), [128, 128]);
+        assert_eq!(bt709_luma([255, 0, 0]), 63);
+        assert_eq!(bt709_chroma([255, 0, 0]), [102, 240]);
+        assert_eq!(bt709_luma([0, 0, 255]), 32);
+        assert_eq!(bt709_chroma([0, 0, 255]), [240, 118]);
+    }
+
+    #[test]
+    fn nv12_skips_row_padding_and_keeps_top_row_first() {
+        let mut frame = solid_frame(2, 2, 12, [255, 255, 255]);
+        frame.bgra[12..20].copy_from_slice(&[0, 0, 0, 255, 0, 0, 0, 255]);
+
+        let nv12 = nv12_bt709(&frame, 2, 2);
+
+        assert_eq!(nv12, [235, 235, 16, 16, 128, 128]);
+    }
+
+    #[test]
+    fn nv12_pads_odd_frames_with_black() {
+        let frame = solid_frame(1, 1, 4, [255, 255, 255]);
+
+        let nv12 = nv12_bt709(&frame, 2, 2);
+
+        assert_eq!(nv12, [235, 16, 16, 16, 128, 128]);
     }
 
     #[test]
