@@ -39,7 +39,7 @@ For multiple targets, prefer `--out-dir <DIR>`. If using `--out`, include `{targ
 
 ## Configure effects
 
-Place `airec.toml` in the working directory for task-specific defaults or in the user home directory for user defaults. The working-directory file wins, and explicit CLI flags win over the selected file. Use `[defaults]` for recording defaults and `[effects]` for click, drag, and movement-trail colors, sizes, durations, and drag thresholds.
+Pass every recording option as a CLI flag on `record` or `start`; do not create or edit `airec.toml`. Use `--fps`, `--quality`, `--no-cursor`, and `--no-effects` for capture settings, and `--click-color-left`, `--click-color-right`, `--click-size`, `--drag-color`, `--trail-color`, their `-size` and `-duration-ms` variants, and `--drag-threshold-px` or `--drag-threshold-ms` for click, drag, and movement-trail effects. Run `airec record --help` for the full list.
 
 ## Convert evidence to GIF
 
