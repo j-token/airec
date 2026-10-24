@@ -68,7 +68,7 @@ jobs:
           git commit -m "misc: 버전을 $version(으)로 올림"
           if ($LASTEXITCODE -ne 0) { throw "nothing to commit; main is already at $version" }
           git tag $tag
-          git push origin HEAD:main $tag
+          git push --atomic origin HEAD:main $tag
           if ($LASTEXITCODE -ne 0) { throw "push failed" }
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
