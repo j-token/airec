@@ -2,7 +2,7 @@
   "name": "airec",
   "displayName": "airec",
   "version": "0.3.0",
-  "description": "Record Windows screen evidence of an agent's work with the airec CLI and convert it to GIF.",
+  "description": "Record Windows or Linux (X11) screen evidence of an agent's work with the airec CLI and convert it to GIF.",
   "author": {
     "name": "j-token",
     "url": "https://github.com/j-token"

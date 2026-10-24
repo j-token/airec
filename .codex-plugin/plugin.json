@@ -1,7 +1,7 @@
 {
   "name": "airec",
   "version": "0.3.0",
-  "description": "Record Windows screen evidence of an agent's work with the airec CLI and convert it to GIF.",
+  "description": "Record Windows or Linux (X11) screen evidence of an agent's work with the airec CLI and convert it to GIF.",
   "author": {
     "name": "j-token",
     "url": "https://github.com/j-token"
@@ -13,8 +13,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "airec",
-    "shortDescription": "Record Windows screen evidence of agent work",
-    "longDescription": "Teaches the agent to record its own Windows computer-use work as MP4 with the airec CLI, check the session state and stop reason, and convert the recording to GIF for pull requests.",
+    "shortDescription": "Record screen evidence of agent work",
+    "longDescription": "Teaches the agent to record its own Windows or Linux (X11) computer-use work as MP4 with the airec CLI, check the session state and stop reason, and convert the recording to GIF for pull requests.",
     "developerName": "j-token",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
