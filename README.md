@@ -11,10 +11,11 @@ An agent finishes a computer-use task and you want to know whether it actually w
 - Records a monitor, several monitors at once, or specific application windows, each to its own file
 - On Windows, captures a window even when other windows cover it, using Windows Graphics Capture
 - Burns click, drag, and pointer-trail effects into the frames so the mouse is visible during playback
+- With `--audio`, records the sound of only the windows you picked, not the whole system
 - Emits lifecycle events as JSONL on stdout, so a script can tell whether recording started, how it is going, and why it stopped
 - Converts a recording to GIF
 
-It has no GUI, no audio capture, no network access, no upload feature, no keyboard hook, and no always-on daemon.
+It has no GUI, no microphone or system-wide audio capture, no network access, no upload feature, no keyboard hook, and no always-on daemon.
 
 > Recordings can contain passwords, tokens, and personal data. Review one before you share it. UAC secure-desktop and DRM-protected content are not bypassed and will appear black.
 
@@ -57,7 +58,7 @@ On a headless server or in a cloud sandbox, give airec a virtual display such as
 
 ### From source
 
-Building from source needs Rust 1.89 or later, and a C compiler on Linux for the bundled OpenH264:
+Building from source needs Rust 1.89 or later, and on Linux a C compiler for the bundled OpenH264 and CMake for the bundled libopus:
 
 ```powershell
 cargo build --release
@@ -99,7 +100,27 @@ airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-
 airec record --window-handle 6758808 --process notepad.exe --duration 30s --out-dir .\rec
 ```
 
-Output is video-only H.264 in a fragmented MP4 at yuv420p, tagged as BT.709 so every player shows the same colors. It plays in the Windows player, in Chrome, and in the GitHub web player. Fragmented means a killed process still leaves a playable file covering everything recorded up to that point.
+Output is H.264 in a fragmented MP4 at yuv420p, tagged as BT.709 so every player shows the same colors, with no audio track unless you ask for one. It plays in the Windows player, in Chrome, and in the GitHub web player. Fragmented means a killed process still leaves a playable file covering everything recorded up to that point.
+
+## Recording a window's audio
+
+`--audio` adds the sound of each recorded window to its own MP4, and nothing else: other applications, system sounds, and the microphone stay out.
+
+```powershell
+airec record --window "Chrome" --audio --duration 30s --out demo.mp4
+airec record --window "Player A" --window "Player B" --audio --duration 30s --out-dir .\rec
+```
+
+With two windows, each file carries only its own window's sound. The audio belongs to the process that owns the window and to that process's children, which is where browsers and other multi-process applications actually play from. Two windows of the same process therefore record the same sound.
+
+| | Windows | Linux |
+| --- | --- | --- |
+| Capture | WASAPI process loopback | the application's PulseAudio streams, also served by PipeWire through `pipewire-pulse` |
+| Codec | AAC 128 kbps, 48 kHz stereo | Opus 128 kbps, 48 kHz stereo |
+
+Time when the application plays nothing is recorded as silence, so the audio stays in step with the video for the whole file. Audio comes from the window's process, not its pixels: a covered or minimized window still records its sound.
+
+`--audio` needs window targets. With a monitor, or with no target and therefore the primary monitor, it fails with `CAPTURE_INIT_FAILED` and `data.component = "audio"`, because a monitor shows many applications and none of their sound belongs to it alone. `doctor` reports under `audio` whether capture works on the machine. On Linux the window must publish `_NET_WM_PID`, which almost every toolkit does, and a PulseAudio or PipeWire server must be running for the user; a bare Xvfb sandbox has none until you start one, such as `pulseaudio --start`.
 
 ## Driving it from an agent
 
@@ -228,6 +249,7 @@ Defaults can live in `airec.toml`, read from the current directory, or from `%US
 fps = 30
 quality = "medium"
 effects = true
+audio = false
 
 [effects]
 click_color_left = "#FFD400"
@@ -244,7 +266,7 @@ On Linux, window capture reads the window's pixels from the X server. Without a 
 
 macOS through ScreenCaptureKit is planned, with a first-run permission step.
 
-Also not present: audio, region capture, keyboard display, streaming, editing, and automatic upload. Upload stays out on purpose, since `gh` and similar tools already do it and airec has no business touching the network.
+Also not present: microphone and system-wide audio, region capture, keyboard display, streaming, editing, and automatic upload. `convert` drops the audio track, since GIF has none. Upload stays out on purpose, since `gh` and similar tools already do it and airec has no business touching the network.
 
 A Tauri v2 and Svelte GUI is planned for v0.4 on top of the same `airec-core` crate the CLI uses.
 
