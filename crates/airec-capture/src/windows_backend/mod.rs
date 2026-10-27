@@ -1,8 +1,10 @@
 //! Windows Graphics Capture frame sources and Media Foundation encoding.
 
+mod audio;
 pub(crate) mod decoder;
 mod encoder;
 
+pub use audio::{diagnose_audio, open_audio};
 pub use encoder::{WindowsEncoderFactory, diagnose_encoders};
 
 use std::path::Path;

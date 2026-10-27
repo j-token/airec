@@ -11,13 +11,13 @@ pub use convert::{ConversionOptions, ConversionResult, convert_mp4_to_gif};
 #[cfg(target_os = "linux")]
 pub use linux_backend::{
     OpenH264EncoderFactory as PlatformEncoderFactory, X11CaptureBackend as PlatformCaptureBackend,
-    diagnose_capture, diagnose_encoders, target_viewport,
+    diagnose_audio, diagnose_capture, diagnose_encoders, open_audio, target_viewport,
 };
 #[cfg(windows)]
 pub use windows_backend::{
     WindowsCaptureBackend as PlatformCaptureBackend,
-    WindowsEncoderFactory as PlatformEncoderFactory, diagnose_capture, diagnose_encoders,
-    target_viewport,
+    WindowsEncoderFactory as PlatformEncoderFactory, diagnose_audio, diagnose_capture,
+    diagnose_encoders, open_audio, target_viewport,
 };
 
 use std::path::{Path, PathBuf};
@@ -44,6 +44,23 @@ pub struct CaptureDiagnostics {
     /// Platform-specific `doctor --json` fields.
     pub fields: serde_json::Map<String, serde_json::Value>,
     pub unavailable_message: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioDiagnostics {
+    pub available: bool,
+    /// How a window's audio is captured, such as `process_loopback`.
+    pub capture: &'static str,
+    pub codec: &'static str,
+    pub error: Option<String>,
+}
+
+fn audio_error(message: impl Into<String>, target: &ResolvedTarget) -> AirecError {
+    AirecError::new(
+        ErrorCode::CaptureInitFailed,
+        message,
+        serde_json::json!({"component": "audio", "target": target.id, "pid": target.pid}),
+    )
 }
 
 /// Screen-space rectangle in physical pixels.
@@ -201,6 +218,7 @@ fn resolve_monitor(monitor: &MonitorInfo, output: &Path, directory: bool) -> Res
         height: monitor.height,
         minimized: false,
         output: output_path(output, directory, &format!("{id}.mp4")),
+        pid: None,
     }
 }
 
@@ -218,6 +236,7 @@ fn resolve_window(window: &WindowInfo, output: &Path, directory: bool) -> Resolv
         height: window.height,
         minimized: window.minimized,
         output: output_path(output, directory, &format!("{id}.mp4")),
+        pid: (window.pid != 0).then_some(window.pid),
     }
 }
 

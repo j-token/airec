@@ -188,6 +188,9 @@ pub struct ResolvedTarget {
     pub height: u32,
     pub minimized: bool,
     pub output: PathBuf,
+    /// Process that owns a window target; its audio is what `--audio` records.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -218,6 +221,8 @@ pub struct RecordingOptions {
     pub quality: Quality,
     pub cursor: bool,
     pub effects: bool,
+    /// Records the audio played by each window target's process into its MP4.
+    pub audio: bool,
     pub effect_styles: EffectStyles,
     pub input: InputOptions,
     pub max_duration: Duration,
@@ -235,6 +240,7 @@ impl Default for RecordingOptions {
             quality: Quality::Medium,
             cursor: true,
             effects: true,
+            audio: false,
             effect_styles: EffectStyles::default(),
             input: InputOptions::default(),
             max_duration: Duration::from_secs(30 * 60),
@@ -286,7 +292,32 @@ pub trait CaptureBackend: TargetCatalog {
 
 pub trait PipelineEncoder: Send {
     fn write_frame(&mut self, frame: &CaptureFrame) -> Result<(), AirecError>;
+    /// Appends interleaved PCM in the [`AUDIO_SAMPLE_RATE`] and [`AUDIO_CHANNELS`] layout to an
+    /// audio track that starts at the session timeline origin and has no gaps.
+    fn write_audio(&mut self, _samples: &[i16]) -> Result<(), AirecError> {
+        Ok(())
+    }
     fn finish(&mut self) -> Result<(), AirecError>;
+}
+
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: usize = 2;
+
+/// Interleaved 16-bit PCM in the [`AUDIO_SAMPLE_RATE`] and [`AUDIO_CHANNELS`] layout, captured
+/// from one playback stream of the recorded application.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioPacket {
+    /// Packets of one stream are laid end to end; different streams are mixed.
+    pub stream: u64,
+    /// Capture time of the first sample, in microseconds since [`RecordingOptions::started_at`].
+    pub t_us: u64,
+    pub samples: Vec<i16>,
+}
+
+pub trait AudioSource: Send {
+    /// Packets captured since the previous call. A source keeps running through transient
+    /// capture failures and only stops delivering, which the session records as silence.
+    fn drain(&mut self) -> Vec<AudioPacket>;
 }
 
 pub trait FrameProcessor: Send {

@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::audio::{AUDIO_DELIVERY_LATENCY_MS, AudioTrack};
 use crate::{
-    AirecError, CaptureFrame, ErrorCode, Event, FailurePolicy, FailureRecord, FrameProcessor,
-    FrameSource, PipelineEncoder, StopReason, SuccessRecord, TargetSummary, Timestamp,
-    aggregate_failures,
+    AirecError, AudioSource, CaptureFrame, ErrorCode, Event, FailurePolicy, FailureRecord,
+    FrameProcessor, FrameSource, PipelineEncoder, StopReason, SuccessRecord, TargetSummary,
+    Timestamp, aggregate_failures,
 };
 
 pub struct Pipeline {
@@ -19,6 +20,8 @@ pub struct Pipeline {
     pub source: Box<dyn FrameSource>,
     pub encoder: Box<dyn PipelineEncoder>,
     pub processor: Box<dyn FrameProcessor>,
+    /// When present, the encoder receives an audio track on the same timeline as the video.
+    pub audio: Option<Box<dyn AudioSource>>,
 }
 
 #[derive(Clone)]
@@ -278,6 +281,10 @@ fn run_pipeline(
 
     let session_started = Instant::now();
     let origin = options.timeline_origin_ms.load(Ordering::Acquire);
+    let mut audio = pipeline
+        .audio
+        .take()
+        .map(|source| AudioTrack::new(source, origin));
     let mut initial_frame = first.clone();
     initial_frame.t_ms = first.t_ms.saturating_sub(origin.min(first.t_ms));
     let initial_frame = match pipeline.processor.process(initial_frame) {
@@ -315,6 +322,7 @@ fn run_pipeline(
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(options.fps.max(1)));
     let mut next_frame_at = Instant::now();
     let mut next_heartbeat = Instant::now() + options.heartbeat_interval;
+    let mut last_written_t_ms = initial_frame.t_ms;
     let mut last_frame = first;
     let mut frames = 1_u64;
     let stop_reason = loop {
@@ -387,6 +395,23 @@ fn run_pipeline(
             );
             return;
         }
+        last_written_t_ms = processed.t_ms;
+        if let Some(audio) = audio.as_mut()
+            && let Err(error) = audio.write_until(
+                pipeline.encoder.as_mut(),
+                last_written_t_ms.saturating_sub(AUDIO_DELIVERY_LATENCY_MS),
+            )
+        {
+            pipeline_failure(
+                &pipeline,
+                &options,
+                error.code,
+                &error.message,
+                StopReason::Error,
+                &sender,
+            );
+            return;
+        }
         frames += 1;
         if Instant::now() >= next_heartbeat {
             let event = Event::Heartbeat {
@@ -403,6 +428,24 @@ fn run_pipeline(
         }
     };
 
+    let video_end_ms = last_written_t_ms + frame_interval.as_millis() as u64;
+    if audio.is_some() {
+        // Lets the capture API deliver the audio played up to the last frame.
+        std::thread::sleep(Duration::from_millis(AUDIO_DELIVERY_LATENCY_MS));
+    }
+    if let Some(audio) = audio.as_mut()
+        && let Err(error) = audio.write_until(pipeline.encoder.as_mut(), video_end_ms)
+    {
+        pipeline_failure(
+            &pipeline,
+            &options,
+            error.code,
+            &error.message,
+            StopReason::Error,
+            &sender,
+        );
+        return;
+    }
     if let Err(error) = pipeline.encoder.finish() {
         pipeline_failure(
             &pipeline,
@@ -682,6 +725,7 @@ mod tests {
             source: Box::new(source),
             encoder: Box::new(MockEncoder),
             processor: Box::new(()),
+            audio: None,
         }
     }
 
@@ -1062,6 +1106,7 @@ mod tests {
             })),
             encoder: Box::new(MockEncoder),
             processor: Box::new(()),
+            audio: None,
         };
         let outcome = run_session(vec![pipeline], options(Duration::from_millis(5)), |_| {});
         assert!(
@@ -1070,5 +1115,51 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Heartbeat { dropped: 7, .. }))
         );
+    }
+
+    struct SilentAudio;
+
+    impl AudioSource for SilentAudio {
+        fn drain(&mut self) -> Vec<crate::AudioPacket> {
+            Vec::new()
+        }
+    }
+
+    struct AudioCountingEncoder(Arc<Mutex<(u64, usize)>>);
+
+    impl PipelineEncoder for AudioCountingEncoder {
+        fn write_frame(&mut self, frame: &CaptureFrame) -> Result<(), AirecError> {
+            self.0.lock().unwrap().0 = frame.t_ms;
+            Ok(())
+        }
+
+        fn write_audio(&mut self, samples: &[i16]) -> Result<(), AirecError> {
+            self.0.lock().unwrap().1 += samples.len();
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<(), AirecError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn audio_track_covers_the_video_through_its_last_frame() {
+        let written = Arc::new(Mutex::new((0, 0)));
+        let mut pipeline = pipeline(MockSource {
+            frames: VecDeque::from([Some(frame()), None]),
+            alive: true,
+        });
+        pipeline.encoder = Box::new(AudioCountingEncoder(written.clone()));
+        pipeline.audio = Some(Box::new(SilentAudio));
+        let mut run_options = options(Duration::from_millis(300));
+        run_options.fps = 50;
+
+        let outcome = run_session(vec![pipeline], run_options, |_| {});
+
+        assert_eq!(outcome.exit_code, 0);
+        let (last_frame_ms, audio_samples) = *written.lock().unwrap();
+        let expected_frames = (last_frame_ms + 20) * 48;
+        assert_eq!(audio_samples as u64, expected_frames * 2);
     }
 }

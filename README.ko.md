@@ -11,10 +11,11 @@ AI 에이전트가 자기 작업을 증거로 남기기 위한 CLI 화면 녹화
 - 모니터 하나, 여러 모니터 동시, 또는 특정 앱 창을 각각 별도 파일로 녹화합니다
 - 윈도우에서는 Windows Graphics Capture를 쓰기 때문에 대상 창이 다른 창에 가려져 있어도 그 창의 내용이 녹화됩니다
 - 클릭, 드래그, 포인터 이동 효과를 프레임에 직접 합성해서 재생할 때 마우스가 보입니다
+- `--audio`를 주면 시스템 전체가 아니라 고른 창의 소리만 녹음합니다
 - 녹화 상태를 stdout에 JSONL로 출력하므로, 스크립트가 녹화 시작 여부와 진행 상황, 종료 사유를 판단할 수 있습니다
 - 녹화본을 GIF로 변환합니다
 
-GUI, 오디오 녹음, 네트워크 접근, 업로드 기능, 키보드 후킹, 상주 데몬은 없습니다.
+GUI, 마이크나 시스템 전체 오디오 녹음, 네트워크 접근, 업로드 기능, 키보드 후킹, 상주 데몬은 없습니다.
 
 > 녹화본에는 비밀번호, 토큰, 개인정보가 담길 수 있습니다. 공유하기 전에 한 번 확인하십시오. UAC 보안 데스크톱과 DRM 보호 콘텐츠는 우회하지 않으며 검은 화면으로 기록됩니다.
 
@@ -57,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/j-token/airec/main/install.sh | sh
 
 ### 소스에서 빌드
 
-소스에서 빌드하려면 Rust 1.89 이상이 필요하고, 리눅스에서는 내장 OpenH264를 컴파일할 C 컴파일러도 필요합니다.
+소스에서 빌드하려면 Rust 1.89 이상이 필요하고, 리눅스에서는 내장 OpenH264를 컴파일할 C 컴파일러와 내장 libopus를 빌드할 CMake도 필요합니다.
 
 ```powershell
 cargo build --release
@@ -99,7 +100,27 @@ airec record --window "Chrome" --window "Windows Terminal" --duration 30s --out-
 airec record --window-handle 6758808 --process notepad.exe --duration 30s --out-dir .\rec
 ```
 
-출력은 yuv420p 비디오 전용 H.264를 담은 fragmented MP4입니다. BT.709 색 정보를 기록하므로 어느 플레이어에서나 같은 색으로 보입니다. 윈도우 기본 플레이어, 크롬, 깃허브 웹 플레이어에서 재생됩니다. fragmented라서 프로세스가 강제 종료돼도 그 시점까지의 영상이 재생 가능한 파일로 남습니다.
+출력은 yuv420p H.264를 담은 fragmented MP4이고, 요청하지 않으면 오디오 트랙은 없습니다. BT.709 색 정보를 기록하므로 어느 플레이어에서나 같은 색으로 보입니다. 윈도우 기본 플레이어, 크롬, 깃허브 웹 플레이어에서 재생됩니다. fragmented라서 프로세스가 강제 종료돼도 그 시점까지의 영상이 재생 가능한 파일로 남습니다.
+
+## 창 소리 녹음
+
+`--audio`는 녹화하는 각 창의 소리를 그 창의 MP4에 넣습니다. 다른 앱, 시스템 효과음, 마이크는 들어가지 않습니다.
+
+```powershell
+airec record --window "Chrome" --audio --duration 30s --out demo.mp4
+airec record --window "Player A" --window "Player B" --audio --duration 30s --out-dir .\rec
+```
+
+창 두 개를 녹화하면 각 파일에 그 창의 소리만 담깁니다. 소리는 창을 소유한 프로세스와 그 자식 프로세스에서 가져옵니다. 브라우저 같은 멀티 프로세스 앱은 실제로 자식 프로세스에서 소리를 내기 때문입니다. 그래서 같은 프로세스의 창 두 개는 같은 소리가 녹음됩니다.
+
+| | 윈도우 | 리눅스 |
+| --- | --- | --- |
+| 캡처 | WASAPI 프로세스 루프백 | 앱의 PulseAudio 스트림. PipeWire도 `pipewire-pulse`로 같은 방식을 지원합니다 |
+| 코덱 | AAC 128 kbps, 48 kHz 스테레오 | Opus 128 kbps, 48 kHz 스테레오 |
+
+앱이 소리를 내지 않는 구간은 무음으로 기록되므로 파일 전체에서 소리와 영상이 어긋나지 않습니다. 소리는 창의 픽셀이 아니라 프로세스에서 가져오므로 가려지거나 최소화된 창도 소리는 녹음됩니다.
+
+`--audio`에는 창 대상이 필요합니다. 모니터를 지정하거나 대상을 생략해 주 모니터가 선택되면 `CAPTURE_INIT_FAILED`와 `data.component = "audio"`로 실패합니다. 모니터에는 여러 앱이 보이고 그중 어느 소리도 모니터 하나의 것이라고 할 수 없기 때문입니다. 이 컴퓨터에서 소리 캡처가 되는지는 `doctor`의 `audio` 항목으로 확인합니다. 리눅스에서는 창이 `_NET_WM_PID`를 제공해야 하고(대부분의 툴킷이 제공합니다), 사용자 세션에 PulseAudio나 PipeWire 서버가 떠 있어야 합니다. Xvfb만 띄운 샌드박스에는 서버가 없으므로 `pulseaudio --start` 같은 명령으로 먼저 띄우십시오.
 
 ## 에이전트에서 사용하기
 
@@ -228,6 +249,7 @@ WebM은 지원하지 않습니다. 윈도우에 항상 쓸 수 있는 내장 Web
 fps = 30
 quality = "medium"
 effects = true
+audio = false
 
 [effects]
 click_color_left = "#FFD400"
@@ -244,7 +266,7 @@ click_color_right = "#00A2FF"
 
 macOS는 ScreenCaptureKit으로 지원할 계획이고, 최초 실행 시 권한을 받는 과정이 필요합니다.
 
-오디오, 영역 지정 녹화, 키보드 입력 표시, 스트리밍, 편집, 자동 업로드도 없습니다. 업로드는 일부러 뺐습니다. `gh` 같은 도구가 이미 하는 일이고 airec가 네트워크를 건드릴 이유가 없습니다.
+마이크와 시스템 전체 오디오, 영역 지정 녹화, 키보드 입력 표시, 스트리밍, 편집, 자동 업로드도 없습니다. GIF에는 소리가 없으므로 `convert`는 오디오 트랙을 버립니다. 업로드는 일부러 뺐습니다. `gh` 같은 도구가 이미 하는 일이고 airec가 네트워크를 건드릴 이유가 없습니다.
 
 v0.4에는 CLI와 같은 `airec-core` 크레이트 위에 Tauri v2 + Svelte GUI를 올릴 계획입니다.
 

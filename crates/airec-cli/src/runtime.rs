@@ -35,6 +35,8 @@ struct LaunchConfig {
     quality: Quality,
     cursor: bool,
     effects: bool,
+    #[serde(default)]
+    audio: bool,
     effect_styles: EffectStyles,
     input: InputOptions,
     max_duration_ms: u64,
@@ -161,6 +163,7 @@ fn start(args: StartArgs) -> Result<i32, (AirecError, bool)> {
         quality: options.quality,
         cursor: options.cursor,
         effects: options.effects,
+        audio: options.audio,
         effect_styles: options.effect_styles,
         input: options.input,
         max_duration_ms: options.max_duration.as_millis() as u64,
@@ -306,6 +309,7 @@ fn stop(args: crate::args::StopArgs) -> Result<i32, (AirecError, bool)> {
 fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
     let capture = diagnose_capture();
     let encoder = diagnose_encoders();
+    let audio = airec_capture::diagnose_audio();
     let mut value = serde_json::json!({
         "encoder": {
             "format": "H.264",
@@ -316,7 +320,12 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
             "hardware_error": encoder.hardware_error,
             "software_error": encoder.software_error,
         },
-        "audio": false,
+        "audio": {
+            "available": audio.available,
+            "capture": audio.capture,
+            "codec": audio.codec,
+            "error": audio.error,
+        },
         "network": false,
         "keyboard_hook": false,
     });
@@ -331,6 +340,10 @@ fn doctor(args: JsonArgs) -> Result<i32, (AirecError, bool)> {
             "Encoder: H.264 FMPEG4 (selected: {})",
             encoder.selected.unwrap_or("unavailable")
         );
+        match &audio.error {
+            None => println!("Audio: {} {}", audio.capture, audio.codec),
+            Some(error) => println!("Audio: unavailable ({error})"),
+        }
     }
     if capture.available && encoder.selected.is_some() {
         Ok(0)
@@ -505,6 +518,7 @@ fn session_child(config_path: &Path) -> Result<i32, AirecError> {
         quality: launch.quality,
         cursor: launch.cursor,
         effects: launch.effects,
+        audio: launch.audio,
         effect_styles: launch.effect_styles,
         input: launch.input,
         max_duration: Duration::from_millis(launch.max_duration_ms),
@@ -580,12 +594,13 @@ fn run_live(
     };
     if options.verbose {
         eprintln!(
-            "airec: session {session}, {} target(s), {} fps, {:?} quality, cursor={}, effects={}",
+            "airec: session {session}, {} target(s), {} fps, {:?} quality, cursor={}, effects={}, audio={}",
             targets.len(),
             options.fps,
             options.quality,
             options.cursor,
-            options.effects
+            options.effects,
+            options.audio
         );
     }
     let mut pipelines = Vec::new();
@@ -763,8 +778,15 @@ fn create_pipeline(
     timeline_origin_ms: Arc<AtomicU64>,
     encoder: Box<dyn airec_core::PipelineEncoder>,
 ) -> Result<Pipeline, AirecError> {
-    let source = match backend.open(target, options) {
-        Ok(source) => source,
+    let opened = backend.open(target, options).and_then(|source| {
+        let audio = options
+            .audio
+            .then(|| airec_capture::open_audio(target, options))
+            .transpose()?;
+        Ok((source, audio))
+    });
+    let (source, audio) = match opened {
+        Ok(opened) => opened,
         Err(error) => {
             drop(encoder);
             let _ = std::fs::remove_file(&target.output);
@@ -791,6 +813,7 @@ fn create_pipeline(
         source,
         encoder,
         processor,
+        audio,
     })
 }
 
@@ -924,7 +947,28 @@ fn prepare(
     let (output, directory) = output_path(recording);
     let backend = PlatformCaptureBackend::new();
     let resolved = backend.resolve(&target_specs, &output, directory)?;
+    if options.audio {
+        require_window_targets_for_audio(&resolved)?;
+    }
     Ok((resolved, options))
+}
+
+/// A monitor shows many applications at once, so there is no single application whose audio
+/// would belong to it.
+fn require_window_targets_for_audio(targets: &[ResolvedTarget]) -> Result<(), AirecError> {
+    let monitors: Vec<_> = targets
+        .iter()
+        .filter(|target| target.kind == TargetKind::Monitor)
+        .map(|target| target.id.clone())
+        .collect();
+    if monitors.is_empty() {
+        return Ok(());
+    }
+    Err(AirecError::new(
+        ErrorCode::CaptureInitFailed,
+        "--audio records the audio of window targets; select windows with --window, --window-handle, or --process",
+        serde_json::json!({"component": "audio", "monitors": monitors}),
+    ))
 }
 
 fn resolve_recording_options(
@@ -965,6 +1009,13 @@ fn resolve_recording_options(
         false
     } else {
         config.defaults.effects.unwrap_or(true)
+    };
+    let audio = if recording.audio {
+        true
+    } else if recording.no_audio {
+        false
+    } else {
+        config.defaults.audio.unwrap_or(false)
     };
     let mut effect_styles = EffectStyles::default();
     effect_styles.click.left_color = resolve_color(
@@ -1063,6 +1114,7 @@ fn resolve_recording_options(
         quality,
         cursor,
         effects,
+        audio,
         effect_styles,
         input,
         max_duration,

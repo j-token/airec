@@ -17,6 +17,7 @@ pub struct DefaultsConfig {
     pub quality: Option<String>,
     pub cursor: Option<bool>,
     pub effects: Option<bool>,
+    pub audio: Option<bool>,
     pub max_duration: Option<String>,
     pub on_failure: Option<String>,
 }

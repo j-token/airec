@@ -178,7 +178,7 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src ubuntu:22.04 bash -c '
             set -euo pipefail
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates build-essential >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates build-essential cmake >/dev/null
             curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             . "$HOME/.cargo/env"
             cargo build --release --locked --target "'"$LINUX_TARGET"'" --bin airec

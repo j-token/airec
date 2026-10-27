@@ -47,6 +47,10 @@ The intended `stop_reason` values are exactly `requested`, `duration_limit`, and
 
 For multiple targets, prefer `--out-dir <DIR>`. If using `--out`, include `{target}` in its filename. Use `--event-log <FILE>.jsonl` only when mouse evidence is needed; airec never captures keyboard events.
 
+## Record a window's audio
+
+Add `--audio` only when the evidence depends on sound, such as a notification, media playback, or a voice call. It records what the target window's application plays, including its child processes, and nothing from other applications or the microphone. Each window's MP4 gets its own audio track; `--audio` with a monitor target is rejected with `CAPTURE_INIT_FAILED` and `data.component = "audio"`, so select windows with `--window`, `--window-handle`, or `--process`. Check `audio.available` in `airec doctor --json` first; on Linux it needs a running PulseAudio or PipeWire (`pipewire-pulse`) server. Time when the application plays nothing is recorded as silence.
+
 ## Configure effects
 
 Pass every recording option as a CLI flag on `record` or `start`; do not create or edit `airec.toml`. Use `--fps`, `--quality`, `--no-cursor`, and `--no-effects` for capture settings, and `--click-color-left`, `--click-color-right`, `--click-size`, `--drag-color`, `--trail-color`, their `-size` and `-duration-ms` variants, and `--drag-threshold-px` or `--drag-threshold-ms` for click, drag, and movement-trail effects. Run `airec record --help` for the full list.

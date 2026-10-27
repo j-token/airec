@@ -1,13 +1,16 @@
-//! X11 capture through core `GetImage`, OpenH264 encoding, and fragmented MP4 output.
+//! X11 capture through core `GetImage`, PulseAudio stream capture, OpenH264 and Opus encoding,
+//! and fragmented MP4 output.
 //!
 //! X11 is used rather than the xdg-desktop-portal ScreenCast API because the portal requires a
 //! person to pick the capture target in a dialog, which an unattended agent cannot do. On a
 //! Wayland session only XWayland windows are visible through X11.
 
+mod audio;
 pub(crate) mod decoder;
 mod encoder;
 mod mp4;
 
+pub use audio::{diagnose_audio, open_audio};
 pub use encoder::{OpenH264EncoderFactory, diagnose_encoders};
 
 use std::cell::RefCell;

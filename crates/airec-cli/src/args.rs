@@ -116,6 +116,12 @@ pub struct RecordingArgs {
     /// Enable effects even when the config default is disabled.
     #[arg(long, conflicts_with = "no_effects")]
     pub effects: bool,
+    /// Record the audio that each window target's application plays, and nothing else.
+    #[arg(long, conflicts_with = "no_audio")]
+    pub audio: bool,
+    /// Record without audio even when the config default enables it.
+    #[arg(long)]
+    pub no_audio: bool,
     #[arg(long)]
     pub max_duration: Option<String>,
     #[arg(long, value_enum)]
@@ -288,6 +294,21 @@ mod tests {
         assert!(args.recording.quality.is_none());
         assert!(args.recording.max_duration.is_none());
         assert!(args.recording.on_failure.is_none());
+    }
+
+    #[test]
+    fn audio_and_no_audio_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "airec",
+                "record",
+                "--window",
+                "App",
+                "--audio",
+                "--no-audio"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
