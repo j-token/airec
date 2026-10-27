@@ -5,7 +5,8 @@
 #
 # Needs DISPLAY plus xdotool, xmessage, xsetroot, ffmpeg, ffprobe, and jq. It drives the real
 # pointer and changes the root window background, so run it on a disposable display where no
-# desktop or panel window covers the root window.
+# desktop or panel window covers the root window. The window audio checks also need ffplay and
+# a running PulseAudio or PipeWire server, and are skipped when doctor reports no audio.
 set -euo pipefail
 
 airec=$(realpath "${1:-target/release/airec}")
@@ -38,6 +39,15 @@ near() {
         [ "${difference#-}" -le "$3" ] || return 1
     done
 }
+# RMS level in dB of a narrow band of the audio track around the given frequency. One bandpass
+# stage only attenuates a tone an octave away by about 17 dB, so two narrow stages are chained.
+band_level() {
+    local band="bandpass=f=$2:width_type=h:w=40"
+    ffmpeg -hide_banner -nostats -i "$1" -map 0:a \
+        -af "$band,$band,astats=measure_overall=RMS_level:measure_perchannel=none" \
+        -f null - 2>&1 | awk '/RMS level dB/ { print $NF }'
+}
+louder_by() { awk -v a="$1" -v b="$2" -v m="$3" 'BEGIN { exit !(a - b >= m) }'; }
 wait_for_window() {
     for _ in $(seq 50); do
         "$airec" list windows --json | jq -e --arg title "$1" 'any(.[]; .title == $title)' \
@@ -161,6 +171,48 @@ killed_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 kil
 awk -v d="$killed_duration" 'BEGIN { exit !(d >= 2) }' || fail "killed recording lasts $killed_duration"
 decodes_cleanly killed.mp4 || fail "killed.mp4 has decode errors"
 pass "SIGKILL after 4 s leaves ${killed_duration}s of playable video"
+
+# Two windows play different tones; each recording holds only its own window's tone.
+if jq -e '.audio.available' <<<"$doctor" >/dev/null; then
+    tone() {
+        ffplay -hide_banner -loglevel error -f lavfi -i "sine=frequency=$1:sample_rate=48000" \
+            -t 60 -autoexit -showmode 1 -window_title "$2" -x 320 -y 180 &
+    }
+    tone 440 airec-e2e-low
+    low_player=$!
+    tone 1000 airec-e2e-high
+    high_player=$!
+    wait_for_window airec-e2e-low || fail "low tone window never appeared"
+    wait_for_window airec-e2e-high || fail "high tone window never appeared"
+    sleep 1
+    "$airec" record --window airec-e2e-low --window airec-e2e-high --audio --duration 4s \
+        --out "audio-{target}.mp4" --json >audio.jsonl || fail "audio record exited $?: $(cat audio.jsonl)"
+    kill "$low_player" "$high_player"
+    wait "$low_player" "$high_player" 2>/dev/null || true
+    low_file=$(ls audio-airec-e2e-low-*.mp4)
+    high_file=$(ls audio-airec-e2e-high-*.mp4)
+    for file in "$low_file" "$high_file"; do
+        [ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels \
+            -of csv=p=0 "$file")" = "opus,48000,2" ] || fail "$file has no 48 kHz stereo Opus track"
+        decodes_cleanly "$file" || fail "$file has decode errors"
+    done
+    low_in_low=$(band_level "$low_file" 440)
+    high_in_low=$(band_level "$low_file" 1000)
+    low_in_high=$(band_level "$high_file" 440)
+    high_in_high=$(band_level "$high_file" 1000)
+    louder_by "$low_in_low" "$high_in_low" 20 ||
+        fail "low window recorded 440 Hz at $low_in_low dB and 1000 Hz at $high_in_low dB"
+    louder_by "$high_in_high" "$low_in_high" 20 ||
+        fail "high window recorded 1000 Hz at $high_in_high dB and 440 Hz at $low_in_high dB"
+    pass "each window's Opus track holds only its own tone ($low_in_low / $high_in_high dB)"
+    converted_audio=$("$airec" convert "$low_file" --json) || fail "convert of audio MP4 exited $?"
+    jq -e '.event == "converted" and .frames >= 1' <<<"$converted_audio" >/dev/null ||
+        fail "convert of audio MP4 printed $converted_audio"
+    pass "a recording with audio converts to GIF"
+    cp "$low_file" "$high_file" "$evidence/"
+else
+    echo "skip - window audio, doctor reports $(jq -c .audio <<<"$doctor")"
+fi
 
 converted=$("$airec" convert monitor.mp4 --json) || fail "convert exited $?: $converted"
 jq -e '.event == "converted" and .width == 960 and .frames >= 1 and .duration_ms >= 4500' \
