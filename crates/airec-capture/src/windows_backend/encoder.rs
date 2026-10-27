@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use airec_core::{
-    AirecError, CaptureFrame, EncoderFactory, ErrorCode, PipelineEncoder, RecordingOptions,
-    ResolvedTarget,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AirecError, CaptureFrame, EncoderFactory, ErrorCode,
+    PipelineEncoder, RecordingOptions, ResolvedTarget,
 };
 use windows_capture::encoder::{
     AudioSettingsBuilder, ContainerSettingsBuilder, ContainerSettingsSubType, VideoEncoder,
@@ -12,6 +12,9 @@ use windows_capture::encoder::{
 
 use crate::yuv::{even, i420_bt709};
 use crate::{EncoderDiagnostics, output_error};
+
+/// One of the rates the Media Foundation AAC encoder accepts: 96, 128, 160, or 192 kbps.
+const AAC_BITRATE: u32 = 128_000;
 
 #[derive(Default)]
 pub struct WindowsEncoderFactory;
@@ -83,6 +86,7 @@ fn probe_encoder_mode(
         height: 720,
         fps: 30,
         bitrate: 4_000_000,
+        audio: false,
     };
     let result = (|| {
         let mut encoder = create_encoder(&config, hardware_acceleration)?;
@@ -114,6 +118,7 @@ impl EncoderFactory for WindowsEncoderFactory {
             height,
             fps: options.fps,
             bitrate: options.quality.bitrate(width, height, options.fps),
+            audio: options.audio,
         };
         match preferred_encoder() {
             PreferredEncoder::Hardware => match create_encoder(&config, true) {
@@ -184,6 +189,7 @@ struct EncoderConfig {
     height: u32,
     fps: u32,
     bitrate: u32,
+    audio: bool,
 }
 
 fn create_encoder(
@@ -196,7 +202,12 @@ fn create_encoder(
             .input_format(VideoInputFormat::Nv12Bt709)
             .bitrate(config.bitrate)
             .frame_rate(config.fps),
-        AudioSettingsBuilder::new().disabled(true),
+        AudioSettingsBuilder::new()
+            .bitrate(AAC_BITRATE)
+            .sample_rate(AUDIO_SAMPLE_RATE)
+            .channel_count(AUDIO_CHANNELS as u32)
+            .bit_per_sample(16)
+            .disabled(!config.audio),
         ContainerSettingsBuilder::new()
             .sub_type(ContainerSettingsSubType::FMPEG4)
             .hardware_acceleration(hardware_acceleration),
@@ -255,6 +266,18 @@ impl PipelineEncoder for MfEncoder {
             )),
             Err(error) => Err(encoder_error(error)),
         }
+    }
+
+    fn write_audio(&mut self, samples: &[i16]) -> Result<(), AirecError> {
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        self.encoder
+            .as_mut()
+            .expect("encoder exists until finish")
+            .send_audio_buffer(&bytes, 0)
+            .map_err(encoder_error)
     }
 
     fn finish(&mut self) -> Result<(), AirecError> {

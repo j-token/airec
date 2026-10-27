@@ -1,6 +1,6 @@
-//! Minimal ISO BMFF support for one H.264 video track: a fragmented MP4 writer, so a killed
-//! recorder leaves a playable file up to its last fragment, and a reader for both fragmented and
-//! regular files.
+//! Minimal ISO BMFF support for one H.264 video track and an optional Opus audio track: a
+//! fragmented MP4 writer, so a killed recorder leaves a playable file up to its last fragment,
+//! and a reader for the video track of both fragmented and regular files.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -8,6 +8,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 /// Media timescale of written tracks, the conventional 90 kHz video clock.
 pub(crate) const TIMESCALE: u32 = 90_000;
 const TRACK_ID: u32 = 1;
+const AUDIO_TRACK_ID: u32 = 2;
+/// Opus always decodes at 48 kHz, so its track counts time in samples.
+pub(crate) const AUDIO_TIMESCALE: u32 = 48_000;
 const SYNC_SAMPLE_FLAGS: u32 = 0x0200_0000;
 const NON_SYNC_SAMPLE_FLAGS: u32 = 0x0101_0000;
 const HIGH_PROFILES: [u8; 4] = [100, 110, 122, 144];
@@ -19,10 +22,26 @@ pub(crate) struct Sample {
     pub sync: bool,
 }
 
+pub(crate) struct AudioSample {
+    /// One Opus packet.
+    pub data: Vec<u8>,
+    /// In [`AUDIO_TIMESCALE`] units.
+    pub duration: u32,
+}
+
+/// Stereo Opus track parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpusTrack {
+    /// Encoder lookahead in 48 kHz samples, which decoders discard from the start.
+    pub pre_skip: u16,
+}
+
 pub(crate) struct FragmentedMp4Writer<W: Write> {
     output: W,
     sequence_number: u32,
     pending: Vec<Sample>,
+    pending_audio: Vec<AudioSample>,
+    audio_decode_time: u64,
 }
 
 impl<W: Write> FragmentedMp4Writer<W> {
@@ -33,14 +52,17 @@ impl<W: Write> FragmentedMp4Writer<W> {
         height: u32,
         sps: &[u8],
         pps: &[u8],
+        audio: Option<OpusTrack>,
     ) -> io::Result<Self> {
         output.write_all(&file_type())?;
-        output.write_all(&movie(width, height, sps, pps)?)?;
+        output.write_all(&movie(width, height, sps, pps, audio)?)?;
         output.flush()?;
         Ok(Self {
             output,
             sequence_number: 0,
             pending: Vec::new(),
+            pending_audio: Vec::new(),
+            audio_decode_time: 0,
         })
     }
 
@@ -54,40 +76,105 @@ impl<W: Write> FragmentedMp4Writer<W> {
         Ok(())
     }
 
+    /// Queues an audio sample that follows the previous one without a gap. It is written with
+    /// the next video fragment.
+    pub(crate) fn push_audio(&mut self, sample: AudioSample) {
+        self.pending_audio.push(sample);
+    }
+
     pub(crate) fn finish(mut self, last_sample_duration: u32) -> io::Result<W> {
-        if let Some(last) = self.pending.last() {
-            let end = last.decode_time + u64::from(last_sample_duration);
-            self.write_fragment(end)?;
-        }
+        let end = self
+            .pending
+            .last()
+            .map_or(0, |last| last.decode_time + u64::from(last_sample_duration));
+        self.write_fragment(end)?;
         self.output.flush()?;
         Ok(self.output)
     }
 
     fn write_fragment(&mut self, end_time: u64) -> io::Result<()> {
-        self.sequence_number += 1;
         let samples = std::mem::take(&mut self.pending);
-        let next_times = samples
+        let audio = std::mem::take(&mut self.pending_audio);
+        let mut runs = Vec::new();
+        if let Some(first) = samples.first() {
+            let next_times = samples
+                .iter()
+                .skip(1)
+                .map(|sample| sample.decode_time)
+                .chain(std::iter::once(end_time));
+            let entries = samples
+                .iter()
+                .zip(next_times)
+                .map(|(sample, next)| RunEntry {
+                    duration: u32::try_from(next.saturating_sub(sample.decode_time))
+                        .unwrap_or(u32::MAX),
+                    size: sample.data.len(),
+                    flags: Some(if sample.sync {
+                        SYNC_SAMPLE_FLAGS
+                    } else {
+                        NON_SYNC_SAMPLE_FLAGS
+                    }),
+                })
+                .collect();
+            runs.push(TrackRun {
+                track_id: TRACK_ID,
+                decode_time: first.decode_time,
+                entries,
+            });
+        }
+        if !audio.is_empty() {
+            runs.push(TrackRun {
+                track_id: AUDIO_TRACK_ID,
+                decode_time: self.audio_decode_time,
+                entries: audio
+                    .iter()
+                    .map(|sample| RunEntry {
+                        duration: sample.duration,
+                        size: sample.data.len(),
+                        flags: None,
+                    })
+                    .collect(),
+            });
+            self.audio_decode_time += audio
+                .iter()
+                .map(|sample| u64::from(sample.duration))
+                .sum::<u64>();
+        }
+        if runs.is_empty() {
+            return Ok(());
+        }
+        self.sequence_number += 1;
+        let payload_len = samples
             .iter()
-            .skip(1)
-            .map(|sample| sample.decode_time)
-            .chain(std::iter::once(end_time));
-        let durations: Vec<u32> = samples
-            .iter()
-            .zip(next_times)
-            .map(|(sample, next)| {
-                u32::try_from(next.saturating_sub(sample.decode_time)).unwrap_or(u32::MAX)
-            })
-            .collect();
-        let payload_len: usize = samples.iter().map(|sample| sample.data.len()).sum();
+            .map(|sample| sample.data.len())
+            .sum::<usize>()
+            + audio.iter().map(|sample| sample.data.len()).sum::<usize>();
 
-        let fragment = movie_fragment(self.sequence_number, &samples, &durations)?;
+        let fragment = movie_fragment(self.sequence_number, &runs)?;
         self.output.write_all(&fragment)?;
         self.output.write_all(&box_header(b"mdat", payload_len)?)?;
         for sample in &samples {
             self.output.write_all(&sample.data)?;
         }
+        for sample in &audio {
+            self.output.write_all(&sample.data)?;
+        }
         self.output.flush()
     }
+}
+
+/// One track's samples in a fragment, laid out in `mdat` in the order of the runs.
+struct TrackRun {
+    track_id: u32,
+    decode_time: u64,
+    entries: Vec<RunEntry>,
+}
+
+struct RunEntry {
+    duration: u32,
+    size: usize,
+    /// Omitted for audio, whose samples are all sync samples by the `trex` default.
+    flags: Option<u32>,
 }
 
 fn box_header(kind: &[u8; 4], body_len: usize) -> io::Result<[u8; 8]> {
@@ -133,7 +220,18 @@ fn file_type() -> Vec<u8> {
     mp4_box(b"ftyp", &body).expect("ftyp is small")
 }
 
-fn movie(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>> {
+fn movie(
+    width: u32,
+    height: u32,
+    sps: &[u8],
+    pps: &[u8],
+    audio: Option<OpusTrack>,
+) -> io::Result<Vec<u8>> {
+    let next_track_id = if audio.is_some() {
+        AUDIO_TRACK_ID + 1
+    } else {
+        TRACK_ID + 1
+    };
     let movie_header = full_box(
         b"mvhd",
         0,
@@ -147,7 +245,7 @@ fn movie(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>>
             vec![0; 10],
             matrix(),
             vec![0; 24],
-            (TRACK_ID + 1).to_be_bytes().to_vec(),
+            next_track_id.to_be_bytes().to_vec(),
         ]),
     )?;
     let track_header = full_box(
@@ -191,7 +289,33 @@ fn movie(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>>
         ]),
     )?;
     let video_media_header = full_box(b"vmhd", 0, 1, &[0; 8])?;
-    let data_information = mp4_box(
+    let media_information = mp4_box(
+        b"minf",
+        &concat(&[
+            video_media_header,
+            data_information()?,
+            sample_table(sample_entry(width, height, sps, pps)?)?,
+        ]),
+    )?;
+    let media = mp4_box(
+        b"mdia",
+        &concat(&[media_header, handler, media_information]),
+    )?;
+    let mut tracks = vec![mp4_box(b"trak", &concat(&[track_header, media]))?];
+    let mut extends = vec![track_extends(TRACK_ID)?];
+    if let Some(audio) = audio {
+        tracks.push(opus_track(audio)?);
+        extends.push(track_extends(AUDIO_TRACK_ID)?);
+    }
+    let movie_extends = mp4_box(b"mvex", &concat(&extends))?;
+    mp4_box(
+        b"moov",
+        &concat(&[movie_header, concat(&tracks), movie_extends]),
+    )
+}
+
+fn data_information() -> io::Result<Vec<u8>> {
+    mp4_box(
         b"dinf",
         &full_box(
             b"dref",
@@ -199,46 +323,125 @@ fn movie(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>>
             0,
             &concat(&[1_u32.to_be_bytes().to_vec(), full_box(b"url ", 0, 1, &[])?]),
         )?,
-    )?;
-    let sample_table = mp4_box(
+    )
+}
+
+/// A sample table with one description and no samples, which all live in fragments.
+fn sample_table(description: Vec<u8>) -> io::Result<Vec<u8>> {
+    mp4_box(
         b"stbl",
         &concat(&[
             full_box(
                 b"stsd",
                 0,
                 0,
-                &concat(&[
-                    1_u32.to_be_bytes().to_vec(),
-                    sample_entry(width, height, sps, pps)?,
-                ]),
+                &concat(&[1_u32.to_be_bytes().to_vec(), description]),
             )?,
             full_box(b"stts", 0, 0, &[0; 4])?,
             full_box(b"stsc", 0, 0, &[0; 4])?,
             full_box(b"stsz", 0, 0, &[0; 8])?,
             full_box(b"stco", 0, 0, &[0; 4])?,
         ]),
+    )
+}
+
+/// Default sample flags of zero mark every fragment sample as a sync sample unless its run
+/// says otherwise.
+fn track_extends(track_id: u32) -> io::Result<Vec<u8>> {
+    full_box(
+        b"trex",
+        0,
+        0,
+        &concat(&[
+            track_id.to_be_bytes().to_vec(),
+            1_u32.to_be_bytes().to_vec(),
+            vec![0; 12],
+        ]),
+    )
+}
+
+fn opus_track(audio: OpusTrack) -> io::Result<Vec<u8>> {
+    let track_header = full_box(
+        b"tkhd",
+        0,
+        0x3,
+        &concat(&[
+            vec![0; 8],
+            AUDIO_TRACK_ID.to_be_bytes().to_vec(),
+            vec![0; 4],
+            vec![0; 4],
+            vec![0; 8],
+            // Layer, alternate group, full volume, and reserved.
+            vec![0, 0, 0, 1, 0x01, 0x00, 0, 0],
+            matrix(),
+            vec![0; 8],
+        ]),
     )?;
+    let media_header = full_box(
+        b"mdhd",
+        0,
+        0,
+        &concat(&[
+            vec![0; 8],
+            AUDIO_TIMESCALE.to_be_bytes().to_vec(),
+            vec![0; 4],
+            0x55c4_u16.to_be_bytes().to_vec(),
+            vec![0; 2],
+        ]),
+    )?;
+    let handler = full_box(
+        b"hdlr",
+        0,
+        0,
+        &concat(&[
+            vec![0; 4],
+            b"soun".to_vec(),
+            vec![0; 12],
+            b"SoundHandler\0".to_vec(),
+        ]),
+    )?;
+    let sound_media_header = full_box(b"smhd", 0, 0, &[0; 4])?;
     let media_information = mp4_box(
         b"minf",
-        &concat(&[video_media_header, data_information, sample_table]),
+        &concat(&[
+            sound_media_header,
+            data_information()?,
+            sample_table(opus_sample_entry(audio)?)?,
+        ]),
     )?;
     let media = mp4_box(
         b"mdia",
         &concat(&[media_header, handler, media_information]),
     )?;
-    let track = mp4_box(b"trak", &concat(&[track_header, media]))?;
-    let track_extends = full_box(
-        b"trex",
-        0,
-        0,
+    mp4_box(b"trak", &concat(&[track_header, media]))
+}
+
+/// The `Opus` sample entry and `dOps` box from the Opus in ISO BMFF encapsulation specification.
+fn opus_sample_entry(audio: OpusTrack) -> io::Result<Vec<u8>> {
+    const CHANNELS: u8 = 2;
+    let specific = mp4_box(
+        b"dOps",
         &concat(&[
-            TRACK_ID.to_be_bytes().to_vec(),
-            1_u32.to_be_bytes().to_vec(),
-            vec![0; 12],
+            vec![0, CHANNELS],
+            audio.pre_skip.to_be_bytes().to_vec(),
+            AUDIO_TIMESCALE.to_be_bytes().to_vec(),
+            // Output gain and channel mapping family 0, which is mono or stereo.
+            vec![0, 0, 0],
         ]),
     )?;
-    let movie_extends = mp4_box(b"mvex", &track_extends)?;
-    mp4_box(b"moov", &concat(&[movie_header, track, movie_extends]))
+    mp4_box(
+        b"Opus",
+        &concat(&[
+            vec![0; 6],
+            1_u16.to_be_bytes().to_vec(),
+            vec![0; 8],
+            u16::from(CHANNELS).to_be_bytes().to_vec(),
+            16_u16.to_be_bytes().to_vec(),
+            vec![0; 4],
+            (AUDIO_TIMESCALE << 16).to_be_bytes().to_vec(),
+            specific,
+        ]),
+    )
 }
 
 fn sample_entry(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>> {
@@ -303,56 +506,71 @@ fn sample_entry(width: u32, height: u32, sps: &[u8], pps: &[u8]) -> io::Result<V
     )
 }
 
-fn movie_fragment(
-    sequence_number: u32,
-    samples: &[Sample],
-    durations: &[u32],
-) -> io::Result<Vec<u8>> {
+fn movie_fragment(sequence_number: u32, runs: &[TrackRun]) -> io::Result<Vec<u8>> {
+    let header = full_box(b"mfhd", 0, 0, &sequence_number.to_be_bytes())?;
+    let build = |data_offsets: &[usize]| -> io::Result<Vec<u8>> {
+        let mut parts = vec![header.clone()];
+        for (run, &data_offset) in runs.iter().zip(data_offsets) {
+            parts.push(track_fragment(run, data_offset)?);
+        }
+        mp4_box(b"moof", &concat(&parts))
+    };
+    // A data offset counts from the start of moof to the run's first byte inside mdat, so it
+    // depends on the size of the moof that contains it; the size does not change with it.
+    let moof_len = build(&vec![0; runs.len()])?.len();
+    let mut data_offsets = Vec::with_capacity(runs.len());
+    let mut data_offset = moof_len + 8;
+    for run in runs {
+        data_offsets.push(data_offset);
+        data_offset += run.entries.iter().map(|entry| entry.size).sum::<usize>();
+    }
+    build(&data_offsets)
+}
+
+fn track_fragment(run: &TrackRun, data_offset: usize) -> io::Result<Vec<u8>> {
     const DEFAULT_BASE_IS_MOOF: u32 = 0x02_0000;
     const DATA_OFFSET: u32 = 0x1;
     const SAMPLE_DURATION: u32 = 0x100;
     const SAMPLE_SIZE: u32 = 0x200;
     const SAMPLE_FLAGS: u32 = 0x400;
 
-    let header = full_box(b"mfhd", 0, 0, &sequence_number.to_be_bytes())?;
-    let fragment_header = full_box(b"tfhd", 0, DEFAULT_BASE_IS_MOOF, &TRACK_ID.to_be_bytes())?;
-    let decode_time = full_box(b"tfdt", 1, 0, &samples[0].decode_time.to_be_bytes())?;
-    let sample_count = u32::try_from(samples.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many samples"))?;
-    let build = |data_offset: i32| -> io::Result<Vec<u8>> {
-        let mut run = Vec::with_capacity(8 + samples.len() * 12);
-        run.extend_from_slice(&sample_count.to_be_bytes());
-        run.extend_from_slice(&data_offset.to_be_bytes());
-        for (sample, duration) in samples.iter().zip(durations) {
-            let size = u32::try_from(sample.data.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sample too large"))?;
-            let flags = if sample.sync {
-                SYNC_SAMPLE_FLAGS
-            } else {
-                NON_SYNC_SAMPLE_FLAGS
-            };
-            run.extend_from_slice(&duration.to_be_bytes());
-            run.extend_from_slice(&size.to_be_bytes());
-            run.extend_from_slice(&flags.to_be_bytes());
+    let too_large =
+        |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{what} too large"));
+    let has_flags = run.entries.iter().any(|entry| entry.flags.is_some());
+    let mut body = Vec::with_capacity(8 + run.entries.len() * 12);
+    body.extend_from_slice(
+        &u32::try_from(run.entries.len())
+            .map_err(|_| too_large("sample count"))?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(
+        &i32::try_from(data_offset)
+            .map_err(|_| too_large("fragment header"))?
+            .to_be_bytes(),
+    );
+    for entry in &run.entries {
+        let size = u32::try_from(entry.size).map_err(|_| too_large("sample"))?;
+        body.extend_from_slice(&entry.duration.to_be_bytes());
+        body.extend_from_slice(&size.to_be_bytes());
+        if let Some(flags) = entry.flags {
+            body.extend_from_slice(&flags.to_be_bytes());
         }
-        let track_run = full_box(
-            b"trun",
-            0,
-            DATA_OFFSET | SAMPLE_DURATION | SAMPLE_SIZE | SAMPLE_FLAGS,
-            &run,
-        )?;
-        let track_fragment = mp4_box(
-            b"traf",
-            &concat(&[fragment_header.clone(), decode_time.clone(), track_run]),
-        )?;
-        mp4_box(b"moof", &concat(&[header.clone(), track_fragment]))
-    };
-    // The data offset counts from the start of moof to the first sample byte inside mdat, so
-    // it depends on the size of the moof that contains it; the size does not change with it.
-    let moof_len = build(0)?.len();
-    let data_offset = i32::try_from(moof_len + 8)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "fragment header too large"))?;
-    build(data_offset)
+    }
+    let run_flags =
+        DATA_OFFSET | SAMPLE_DURATION | SAMPLE_SIZE | if has_flags { SAMPLE_FLAGS } else { 0 };
+    mp4_box(
+        b"traf",
+        &concat(&[
+            full_box(
+                b"tfhd",
+                0,
+                DEFAULT_BASE_IS_MOOF,
+                &run.track_id.to_be_bytes(),
+            )?,
+            full_box(b"tfdt", 1, 0, &run.decode_time.to_be_bytes())?,
+            full_box(b"trun", 0, run_flags, &body)?,
+        ]),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -889,7 +1107,7 @@ mod tests {
     fn fragmented_file_round_trips_sample_locations_and_timeline() {
         let path = test_file("round-trip");
         let file = File::create(&path).unwrap();
-        let mut writer = FragmentedMp4Writer::new(file, 640, 360, &SPS, &PPS).unwrap();
+        let mut writer = FragmentedMp4Writer::new(file, 640, 360, &SPS, &PPS, None).unwrap();
         writer.push(sample(1, 10, 9_000, true)).unwrap();
         writer.push(sample(2, 20, 12_000, false)).unwrap();
         writer.push(sample(3, 30, 15_000, true)).unwrap();
@@ -923,10 +1141,44 @@ mod tests {
     }
 
     #[test]
+    fn audio_samples_follow_video_in_each_fragment_without_moving_video_samples() {
+        let path = test_file("audio");
+        let file = File::create(&path).unwrap();
+        let mut writer =
+            FragmentedMp4Writer::new(file, 64, 64, &SPS, &PPS, Some(OpusTrack { pre_skip: 312 }))
+                .unwrap();
+        writer.push(sample(1, 10, 0, true)).unwrap();
+        writer.push_audio(AudioSample {
+            data: vec![0xa1; 7],
+            duration: 960,
+        });
+        writer.push(sample(2, 10, 3_000, true)).unwrap();
+        writer.push_audio(AudioSample {
+            data: vec![0xa2; 5],
+            duration: 960,
+        });
+        writer.finish(3_000).unwrap();
+
+        let track = read_video_track(&mut File::open(&path).unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(track.samples.len(), 2);
+        for (location, byte) in track.samples.iter().zip([1_u8, 2]) {
+            let end = location.offset as usize + location.size as usize;
+            assert_eq!(bytes[end - 1], byte);
+        }
+        let first_end = track.samples[0].offset as usize + track.samples[0].size as usize;
+        assert_eq!(bytes[first_end..first_end + 7], [0xa1; 7]);
+        let dops = bytes.windows(4).position(|w| w == b"dOps").unwrap() + 4;
+        assert_eq!(bytes[dops..dops + 4], [0, 2, 0x01, 0x38]);
+    }
+
+    #[test]
     fn truncated_trailing_fragment_keeps_the_complete_ones() {
         let path = test_file("truncated");
         let file = File::create(&path).unwrap();
-        let mut writer = FragmentedMp4Writer::new(file, 64, 64, &SPS, &PPS).unwrap();
+        let mut writer = FragmentedMp4Writer::new(file, 64, 64, &SPS, &PPS, None).unwrap();
         writer.push(sample(1, 10, 0, true)).unwrap();
         writer.push(sample(2, 10, 3_000, true)).unwrap();
         writer.finish(3_000).unwrap();

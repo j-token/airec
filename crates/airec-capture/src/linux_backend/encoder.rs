@@ -3,8 +3,8 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use airec_core::{
-    AirecError, CaptureFrame, EncoderFactory, ErrorCode, PipelineEncoder, RecordingOptions,
-    ResolvedTarget,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AirecError, CaptureFrame, EncoderFactory, ErrorCode,
+    PipelineEncoder, RecordingOptions, ResolvedTarget,
 };
 use openh264::OpenH264API;
 use openh264::encoder::{
@@ -13,13 +13,18 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSlices;
 
-use super::mp4::{FragmentedMp4Writer, Sample, TIMESCALE};
+use super::mp4::{AudioSample, FragmentedMp4Writer, OpusTrack, Sample, TIMESCALE};
 use crate::yuv::{even, i420_bt709};
 use crate::{EncoderDiagnostics, output_error};
 
 const NAL_TYPE_IDR_SLICE: u8 = 5;
 const NAL_TYPE_SPS: u8 = 7;
 const NAL_TYPE_PPS: u8 = 8;
+const OPUS_BITRATE: i32 = 128_000;
+/// 20 ms, the frame length Opus is tuned for.
+const OPUS_FRAME_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 50;
+/// The largest packet libopus produces for one frame.
+const OPUS_MAX_PACKET: usize = 1_275;
 
 #[derive(Default)]
 pub struct OpenH264EncoderFactory;
@@ -96,6 +101,17 @@ impl EncoderFactory for OpenH264EncoderFactory {
                 serde_json::json!({"software": error.to_string()}),
             )
         })?;
+        let audio = options
+            .audio
+            .then(OpusAudio::new)
+            .transpose()
+            .map_err(|error| {
+                AirecError::new(
+                    ErrorCode::EncoderUnavailable,
+                    "Opus encoder failed to start",
+                    serde_json::json!({"audio": error.to_string()}),
+                )
+            })?;
         let file =
             File::create(&target.output).map_err(|error| output_error(&target.output, error))?;
         Ok(Box::new(OpenH264Mp4Encoder {
@@ -107,6 +123,7 @@ impl EncoderFactory for OpenH264EncoderFactory {
             height,
             fps: options.fps,
             last_decode_time: None,
+            audio,
         }))
     }
 }
@@ -121,6 +138,73 @@ struct OpenH264Mp4Encoder {
     height: u32,
     fps: u32,
     last_decode_time: Option<u64>,
+    audio: Option<OpusAudio>,
+}
+
+struct OpusAudio {
+    encoder: opus::Encoder,
+    pre_skip: u16,
+    /// Samples that do not fill a whole Opus frame yet.
+    pcm: Vec<i16>,
+    /// Packets encoded before the MP4 writer exists.
+    held: Vec<AudioSample>,
+}
+
+impl OpusAudio {
+    fn new() -> Result<Self, opus::Error> {
+        let mut encoder = opus::Encoder::new(
+            AUDIO_SAMPLE_RATE,
+            opus::Channels::Stereo,
+            opus::Application::Audio,
+        )?;
+        encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE))?;
+        let pre_skip = u16::try_from(encoder.get_lookahead()?).unwrap_or(0);
+        Ok(Self {
+            encoder,
+            pre_skip,
+            pcm: Vec::new(),
+            held: Vec::new(),
+        })
+    }
+
+    /// Encodes every whole frame in the buffered samples.
+    fn encode_frames(&mut self) -> Result<Vec<AudioSample>, opus::Error> {
+        let frame_len = OPUS_FRAME_SAMPLES * AUDIO_CHANNELS;
+        let mut samples = Vec::new();
+        let mut packet = [0_u8; OPUS_MAX_PACKET];
+        let whole_frames_len = self.pcm.len() / frame_len * frame_len;
+        for frame in self.pcm[..whole_frames_len].chunks_exact(frame_len) {
+            let len = self.encoder.encode(frame, &mut packet)?;
+            samples.push(AudioSample {
+                data: packet[..len].to_vec(),
+                duration: OPUS_FRAME_SAMPLES as u32,
+            });
+        }
+        self.pcm.drain(..whole_frames_len);
+        Ok(samples)
+    }
+
+    /// Pads the last partial frame with silence so no captured sample is lost.
+    fn encode_remainder(&mut self) -> Result<Vec<AudioSample>, opus::Error> {
+        let frame_len = OPUS_FRAME_SAMPLES * AUDIO_CHANNELS;
+        if !self.pcm.is_empty() {
+            self.pcm
+                .resize(self.pcm.len().div_ceil(frame_len) * frame_len, 0);
+        }
+        self.encode_frames()
+    }
+}
+
+impl OpenH264Mp4Encoder {
+    fn push_audio(&mut self, samples: Vec<AudioSample>) {
+        match (&mut self.writer, &mut self.audio) {
+            (Some(writer), _) => samples
+                .into_iter()
+                .for_each(|sample| writer.push_audio(sample)),
+            (None, Some(audio)) => audio.held.extend(samples),
+            (None, None) => {}
+        }
+    }
 }
 
 impl PipelineEncoder for OpenH264Mp4Encoder {
@@ -156,10 +240,24 @@ impl PipelineEncoder for OpenH264Mp4Encoder {
                 .file
                 .take()
                 .expect("file is held until the writer exists");
+            let audio_track = self.audio.as_ref().map(|audio| OpusTrack {
+                pre_skip: audio.pre_skip,
+            });
             self.writer = Some(
-                FragmentedMp4Writer::new(BufWriter::new(file), self.width, self.height, sps, pps)
-                    .map_err(|error| output_error(&self.path, error))?,
+                FragmentedMp4Writer::new(
+                    BufWriter::new(file),
+                    self.width,
+                    self.height,
+                    sps,
+                    pps,
+                    audio_track,
+                )
+                .map_err(|error| output_error(&self.path, error))?,
             );
+            if let Some(audio) = &mut self.audio {
+                let held = std::mem::take(&mut audio.held);
+                self.push_audio(held);
+            }
         }
         let decode_time = frame_grid_time(frame.t_ms, self.fps, self.last_decode_time);
         self.last_decode_time = Some(decode_time);
@@ -174,7 +272,25 @@ impl PipelineEncoder for OpenH264Mp4Encoder {
             .map_err(|error| output_error(&self.path, error))
     }
 
+    fn write_audio(&mut self, samples: &[i16]) -> Result<(), AirecError> {
+        let Some(audio) = &mut self.audio else {
+            return Ok(());
+        };
+        audio.pcm.extend_from_slice(samples);
+        let encoded = audio
+            .encode_frames()
+            .map_err(|error| encoder_error(&self.path, error))?;
+        self.push_audio(encoded);
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<(), AirecError> {
+        if let Some(audio) = &mut self.audio {
+            let encoded = audio
+                .encode_remainder()
+                .map_err(|error| encoder_error(&self.path, error))?;
+            self.push_audio(encoded);
+        }
         let Some(writer) = self.writer.take() else {
             return Ok(());
         };
@@ -306,6 +422,22 @@ mod tests {
         let late = frame_grid_time(200, 30, Some(crowded));
 
         assert_eq!([first, early, crowded, late], [0, 3_000, 6_000, 18_000]);
+    }
+
+    #[test]
+    fn audio_is_encoded_in_whole_frames_and_the_remainder_is_padded() {
+        let mut audio = OpusAudio::new().unwrap();
+        audio
+            .pcm
+            .extend(vec![0; OPUS_FRAME_SAMPLES * AUDIO_CHANNELS * 3 / 2]);
+
+        let whole = audio.encode_frames().unwrap();
+        let remainder = audio.encode_remainder().unwrap();
+
+        assert_eq!(whole.len(), 1);
+        assert_eq!(remainder.len(), 1);
+        assert!(audio.pcm.is_empty());
+        assert_eq!(remainder[0].duration, 960);
     }
 
     #[test]
